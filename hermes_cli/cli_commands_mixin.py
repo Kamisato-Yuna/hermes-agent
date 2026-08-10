@@ -2130,14 +2130,40 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
         return True
 
     def _handle_voice_command(self, command: str):
-        """Handle /voice [on|off|tts|status] command."""
+        """Handle /voice [on|off|tts|status|devices] command."""
         subcommand = _command_arg(command, lower=True) or ("off" if self._voice_mode else "on")
+        if subcommand in {"devices", "device"}:
+            try:
+                from tools.voice_mode import list_audio_input_devices
+                devices = list_audio_input_devices()
+            except Exception as exc:
+                _cp(f"Unable to list input devices: {exc}")
+                return
+            if not devices:
+                _cp("No input-capable audio devices found.")
+                return
+            _cp("Available voice input devices:")
+            for device in devices:
+                rate = device.get("default_samplerate")
+                rate_text = (
+                    f", {int(rate)} Hz"
+                    if isinstance(rate, (int, float)) and rate > 0 else ""
+                )
+                _cp(
+                    f"  [{device['index']}] {device['name']} "
+                    f"({device['max_input_channels']} input channel(s){rate_text})"
+                )
+            _cp("Set one with voice.input_device in config.yaml.")
+            return
         actions = {"on": self._enable_voice_mode, "off": self._disable_voice_mode,
                    "tts": self._toggle_voice_tts, "status": self._show_voice_status}
         if subcommand in actions:
             actions[subcommand]()
         else:
-            _cp(_t("voice.unknown_subcommand", subcommand=subcommand), _t("voice.usage"))
+            _cp(
+                _t("voice.unknown_subcommand", subcommand=subcommand),
+                f"{_t('voice.usage')} | /voice devices",
+            )
 
     def _handle_wake_command(self, command: str):
         """Handle /wake [on|off|status] — the 'Hey Hermes' hotword listener. The toggle IS the

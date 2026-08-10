@@ -290,6 +290,38 @@ class TestCheckVoiceRequirements:
         assert result["missing_packages"] == []
 
 
+    def test_local_mlx_reports_runtime_readiness_failure(self, monkeypatch):
+        monkeypatch.setattr("tools.voice_mode._audio_available", lambda: True)
+        monkeypatch.setattr(
+            "tools.voice_mode.detect_audio_environment",
+            lambda: {"available": True, "warnings": []},
+        )
+        monkeypatch.setattr(
+            "tools.transcription_tools._load_stt_config",
+            lambda: {
+                "enabled": True,
+                "provider": "local_mlx",
+                "mlx": {"python": "/missing/python", "language": "zh", "task": "transcribe"},
+            },
+        )
+        monkeypatch.setattr("tools.transcription_tools._get_provider", lambda cfg: "local_mlx")
+        monkeypatch.setattr(
+            "tools.transcription_tools.check_local_mlx_requirements",
+            lambda cfg: {
+                "ready": False,
+                "errors": ["MLX Python is missing or not executable: /missing/python"],
+                "warnings": [],
+            },
+        )
+
+        from tools.voice_mode import check_voice_requirements
+
+        result = check_voice_requirements()
+        assert result["available"] is False
+        assert result["stt_available"] is False
+        assert "MLX Python is missing" in result["details"]
+
+
     def test_plugin_stt_provider(self, monkeypatch):
         """Plugin STT provider is recognized."""
         monkeypatch.setattr("tools.voice_mode._audio_available", lambda: True)
@@ -362,6 +394,35 @@ class TestAudioRecorder:
         assert recorder.is_recording is True
         mock_sd.InputStream.assert_called_once()
         mock_stream.start.assert_called_once()
+
+    def test_lists_only_input_capable_devices(self, monkeypatch):
+        fake_sd = MagicMock()
+        fake_sd.query_devices.return_value = [
+            {"name": "Built-in Mic", "max_input_channels": 2, "default_samplerate": 48000},
+            {"name": "Speakers", "max_input_channels": 0, "default_samplerate": 48000},
+            {"name": "USB Mic", "max_input_channels": 1, "default_samplerate": 16000},
+        ]
+        monkeypatch.setattr("tools.voice_mode._import_audio", lambda: (fake_sd, MagicMock()))
+
+        from tools.voice_mode import list_audio_input_devices
+
+        devices = list_audio_input_devices()
+        assert [device["index"] for device in devices] == [0, 2]
+        assert [device["name"] for device in devices] == ["Built-in Mic", "USB Mic"]
+
+    def test_selected_device_is_forwarded_to_input_stream(self, monkeypatch):
+        fake_sd = MagicMock()
+        fake_sd.query_devices.return_value = {"default_samplerate": 16000}
+        fake_sd.InputStream.return_value = MagicMock()
+        monkeypatch.setattr("tools.voice_mode._import_audio", lambda: (fake_sd, MagicMock()))
+        monkeypatch.setattr("tools.voice_mode._termux_voice_capture_available", lambda: False)
+
+        from tools.voice_mode import create_audio_recorder
+
+        recorder = create_audio_recorder(device=2)
+        recorder.start()
+        assert fake_sd.InputStream.call_args.kwargs["device"] == 2
+        assert fake_sd.query_devices.call_args.args[0] == 2
 
     def test_ensure_stream_rebuilds_inactive_stream(self, mock_sd):
         from tools.voice_mode import AudioRecorder

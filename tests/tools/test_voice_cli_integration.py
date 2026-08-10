@@ -138,6 +138,45 @@ class TestEnableVoiceModeReal:
         cli._enable_voice_mode()
         assert cli._voice_mode is True
 
+    @patch("cli._cprint")
+    @patch(
+        "tools.transcription_tools.prewarm_local_mlx",
+        return_value={"success": True, "prewarm": True},
+    )
+    @patch(
+        "hermes_cli.config.load_config",
+        return_value={
+            "voice": {},
+            "stt": {
+                "enabled": True,
+                "provider": "local_mlx",
+                "mlx": {
+                    "python": "/mlx/python",
+                    "model": "test-model",
+                    "language": "zh",
+                    "task": "transcribe",
+                },
+            },
+        },
+    )
+    @patch(
+        "tools.voice_mode.check_voice_requirements",
+        return_value={
+            "available": True,
+            "details": "OK",
+            "stt_readiness": {"ready": True},
+        },
+    )
+    @patch("tools.voice_mode.detect_audio_environment", return_value={"available": True, "warnings": []})
+    def test_local_mlx_is_pre_warmed_before_enable(
+        self, _env, _req, _cfg, mock_prewarm, _cp
+    ):
+        cli = _make_voice_cli()
+        cli._enable_voice_mode()
+        assert cli._voice_mode is True
+        mock_prewarm.assert_called_once()
+        assert mock_prewarm.call_args.args[0]["provider"] == "local_mlx"
+
 
 class TestVoiceBeepConfigReal:
     """Tests the CLI voice beep toggle."""
@@ -409,7 +448,11 @@ class TestVoiceStopAndTranscribeReal:
         messages = [call.args[0] for call in mock_print.call_args_list]
         assert any(t("cli.voice.transcribing") in message for message in messages)
         assert all("Hugging Face" not in message for message in messages)
-        mock_transcribe.assert_called_once_with("/tmp/test.wav", model="whisper-1")
+        mock_transcribe.assert_called_once_with(
+            "/tmp/test.wav",
+            model="whisper-1",
+            cancel_event=None,
+        )
 
 
 # ---------------------------------------------------------------------------

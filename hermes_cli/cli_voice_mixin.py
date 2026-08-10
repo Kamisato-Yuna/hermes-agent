@@ -83,6 +83,9 @@ class CLIVoiceMixin:
         with self._voice_lock:
             if self._voice_recording:
                 return
+            if not hasattr(self, "_voice_stt_cancel"):
+                self._voice_stt_cancel = threading.Event()
+            self._voice_stt_cancel.clear()
             self._voice_recording = True
 
         voice_cfg = _config_section("voice")
@@ -91,7 +94,11 @@ class CLIVoiceMixin:
         # failure or every future voice start is silently skipped by the guard above.
         if self._voice_recorder is None:
             try:
-                self._voice_recorder = create_audio_recorder()
+                input_device = voice_cfg.get("input_device")
+                if input_device is None:
+                    self._voice_recorder = create_audio_recorder()
+                else:
+                    self._voice_recorder = create_audio_recorder(device=input_device)
             except Exception:
                 with self._voice_lock:
                     self._voice_recording = False
@@ -201,6 +208,7 @@ class CLIVoiceMixin:
 
         submitted = False
         transcription_failed = False
+        transcription_cancelled = False
         wav_path = None
         try:
             if self._voice_recorder is None:
@@ -219,7 +227,11 @@ class CLIVoiceMixin:
                 _cprint(f"{_DIM}{t('cli.voice.transcribing')}{_RST}")
             from tools.voice_mode_transcript import is_voice_stop_phrase
             from tools.voice_mode import transcribe_recording
-            result = transcribe_recording(wav_path, model=stt_model)
+            result = transcribe_recording(
+                wav_path,
+                model=stt_model,
+                cancel_event=getattr(self, "_voice_stt_cancel", None),
+            )
             if result.get("success") and result.get("transcript", "").strip():
                 transcript = result["transcript"].strip()
                 if is_voice_stop_phrase(transcript):
@@ -240,8 +252,12 @@ class CLIVoiceMixin:
             elif result.get("success"):
                 _cprint(f"{_DIM}{t('cli.voice.no_speech')}{_RST}")
             else:
-                _cprint(f"\n{_DIM}{t('cli.voice.transcription_failed', error=result.get('error') or t('cli.shared.unknown_error'))}{_RST}")
-                transcription_failed = True
+                if result.get("error_type") == "cancelled":
+                    _cprint(f"\n{_DIM}Transcription cancelled.{_RST}")
+                    transcription_cancelled = True
+                else:
+                    _cprint(f"\n{_DIM}{t('cli.voice.transcription_failed', error=result.get('error') or t('cli.shared.unknown_error'))}{_RST}")
+                    transcription_failed = True
         except Exception as e:
             _cprint(f"\n{_DIM}{t('cli.voice.processing_error', error=e)}{_RST}")
             transcription_failed = wav_path is not None
@@ -253,7 +269,7 @@ class CLIVoiceMixin:
             # On failure keep the source recording so long dictation is not lost.
             try:
                 if wav_path and os.path.isfile(wav_path):
-                    if transcription_failed:
+                    if transcription_failed and not transcription_cancelled:
                         _cprint(f"{_DIM}{t('cli.voice.recording_preserved', path=wav_path)}{_RST}")
                     else:
                         os.unlink(wav_path)
@@ -522,6 +538,26 @@ class CLIVoiceMixin:
                     _cprint(f"  {_DIM}{t('cli.voice.termux_install_hint')}{_RST}")
             return
 
+        if reqs.get("stt_readiness") is not None:
+            stt_cfg = _config_section("stt")
+            mlx_cfg = stt_cfg.get("mlx")
+            mlx_cfg = mlx_cfg if isinstance(mlx_cfg, dict) else {}
+            from utils import is_truthy_value
+            prewarm = is_truthy_value(mlx_cfg.get("prewarm_on_voice_start", True), default=True)
+            if prewarm:
+                _cprint(f"\n{_DIM}Preparing local MLX Whisper model...{_RST}")
+                try:
+                    from tools.transcription_tools import prewarm_local_mlx
+                    warmup = prewarm_local_mlx(stt_cfg)
+                except Exception as exc:
+                    warmup = {"success": False, "error": f"MLX prewarm failed: {exc}"}
+                if not warmup.get("success"):
+                    _cprint(
+                        f"{_ACCENT}MLX model prewarm failed:{_RST} "
+                        f"{_DIM}{warmup.get('error', 'unknown error')}{_RST}"
+                    )
+                    return
+
         with self._voice_lock:
             self._voice_mode = True
         if _config_section("voice").get("auto_tts", False):
@@ -578,6 +614,11 @@ class CLIVoiceMixin:
         """Disable voice mode, cancel any active recording, and stop TTS."""
         from cli import _DIM, _RST, _cprint, logger
         with self._voice_lock:
+            stt_cancel = getattr(self, "_voice_stt_cancel", None)
+            if stt_cancel is None:
+                stt_cancel = threading.Event()
+                self._voice_stt_cancel = stt_cancel
+            stt_cancel.set()
             if self._voice_recording and self._voice_recorder:
                 self._voice_recorder.cancel()
                 self._voice_recording = False

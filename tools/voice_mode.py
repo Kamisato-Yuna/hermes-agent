@@ -125,14 +125,46 @@ def _rms(np, data) -> float:
     return float(np.sqrt(np.mean(data.astype(np.float64) ** 2)))
 
 
-def _default_input_samplerate(sd) -> int:
+def _default_input_samplerate(sd, device=None) -> int:
     """Default input device rate, else the Whisper-friendly SAMPLE_RATE."""
     with suppress(Exception):
-        info = sd.query_devices(None, "input")
+        info = sd.query_devices(device, "input")
         rate = info.get("default_samplerate") if isinstance(info, dict) else getattr(info, "default_samplerate", None)
         if isinstance(rate, (int, float)) and rate > 0:
             return round(rate)
     return SAMPLE_RATE
+
+
+def list_audio_input_devices() -> List[Dict[str, Any]]:
+    """Return input-capable PortAudio devices for explicit voice selection."""
+    try:
+        sd, _ = _import_audio()
+        raw_devices = sd.query_devices()
+    except (ImportError, OSError):
+        return []
+    if isinstance(raw_devices, dict):
+        raw_devices = [raw_devices]
+    devices: List[Dict[str, Any]] = []
+    try:
+        for index, device in enumerate(raw_devices):
+            if not isinstance(device, dict):
+                continue
+            try:
+                input_channels = int(device.get("max_input_channels", 0) or 0)
+            except (TypeError, ValueError):
+                input_channels = 0
+            if input_channels <= 0:
+                continue
+            devices.append({
+                "index": index,
+                "name": str(device.get("name") or f"Input device {index}"),
+                "hostapi": str(device.get("hostapi") or ""),
+                "max_input_channels": input_channels,
+                "default_samplerate": device.get("default_samplerate"),
+            })
+    except (TypeError, ValueError):
+        return []
+    return devices
 
 
 # ── Environment detection ──
@@ -668,11 +700,12 @@ class AudioRecorder(_RecorderBase):
 
     supports_silence_autostop = True
 
-    def __init__(self) -> None:
+    def __init__(self, device: Any = None) -> None:
         super().__init__()
         self._stream: Any = None
         self._frames: list[Any] = []
         self._sample_rate: int = SAMPLE_RATE
+        self._device = device
         self._on_silence_stop = None
         self._silence_threshold: int = SILENCE_RMS_THRESHOLD
         self._silence_duration: float = SILENCE_DURATION_SECONDS
@@ -809,8 +842,15 @@ class AudioRecorder(_RecorderBase):
         stream = None
         for attempt in range(2):
             try:  # may block on CoreAudio (first call only)
-                stream = sd.InputStream(samplerate=self._sample_rate, channels=CHANNELS, dtype=DTYPE,
-                                        callback=_callback)
+                stream_kwargs = {
+                    "samplerate": self._sample_rate,
+                    "channels": CHANNELS,
+                    "dtype": DTYPE,
+                    "callback": _callback,
+                }
+                if self._device is not None:
+                    stream_kwargs["device"] = self._device
+                stream = sd.InputStream(**stream_kwargs)
                 stream.start()
                 break
             except Exception as e:
@@ -846,7 +886,7 @@ class AudioRecorder(_RecorderBase):
             self._peak_rms = 0
             self._current_rms = 0
             self._on_silence_stop = on_silence_stop
-        self._sample_rate = _default_input_samplerate(sd)
+        self._sample_rate = _default_input_samplerate(sd, self._device)
         self._ensure_stream()
         self._open_live_session(self._sample_rate)
         with self._lock:
@@ -932,9 +972,9 @@ class AudioRecorder(_RecorderBase):
         return wav_path
 
 
-def create_audio_recorder() -> AudioRecorder | TermuxAudioRecorder:
+def create_audio_recorder(device: Any = None) -> AudioRecorder | TermuxAudioRecorder:
     """Return the best recorder backend for the current environment."""
-    return TermuxAudioRecorder() if _termux_voice_capture_available() else AudioRecorder()
+    return TermuxAudioRecorder() if _termux_voice_capture_available() else AudioRecorder(device=device)
 
 
 # ── STT dispatch ──
@@ -954,7 +994,12 @@ def _live_result(wav_path: str) -> Optional[dict[str, Any]]:
     return None
 
 
-def transcribe_recording(wav_path: str, model: Optional[str] = None) -> dict[str, Any]:
+def transcribe_recording(
+    wav_path: str,
+    model: Optional[str] = None,
+    *,
+    cancel_event: Optional[threading.Event] = None,
+) -> dict[str, Any]:
     """Transcribe a WAV via ``transcribe_audio()``, filtering Whisper hallucinations;
     returns ``{success, transcript[, error]}``."""
     from tools.transcription_tools import transcribe_audio
@@ -962,7 +1007,8 @@ def transcribe_recording(wav_path: str, model: Optional[str] = None) -> dict[str
     result = _live_result(wav_path)
     if result is None:
         # transcribe_audio fits oversized recordings under the provider's upload cap itself.
-        result = transcribe_audio(wav_path, model=model, source="voice_mode")
+        result = transcribe_audio(
+            wav_path, model=model, source="voice_mode", cancel_event=cancel_event)
     # A configured stop phrase always survives: "bye"/"okay" overlap the
     # hallucination blocklist, and swallowing them would make "bye" fail to end the chat.
     if result.get("success"):
@@ -1502,13 +1548,26 @@ def check_voice_requirements() -> dict[str, Any]:
     """Check voice mode requirements: ``{available, audio_available, stt_available,
     missing_packages, details, environment}``."""
     from tools.transcription_tools import (
-        _get_provider, _load_stt_config, _resolve_command_stt_provider_config, is_stt_enabled)
+        _get_provider, _load_stt_config, _resolve_command_stt_provider_config,
+        check_local_mlx_requirements, is_stt_enabled)
     stt_config = _load_stt_config()
     stt_enabled = is_stt_enabled(stt_config)
     stt_provider = _get_provider(stt_config)
+    mlx_readiness = None
+    if stt_provider == "local_mlx" and stt_enabled:
+        try:
+            mlx_readiness = check_local_mlx_requirements(stt_config)
+        except Exception as exc:
+            logger.warning("MLX readiness check failed: %s", exc, exc_info=True)
+            mlx_readiness = {
+                "ready": False,
+                "errors": [f"MLX readiness check failed: {exc}"],
+                "warnings": [],
+            }
     stt_label = None  # "OK (...)" once a native / command / plugin provider resolves
     if stt_provider in _NATIVE_STT_LABELS:
-        stt_label = f"OK ({_NATIVE_STT_LABELS[stt_provider]})"
+        if stt_provider != "local_mlx" or (mlx_readiness and mlx_readiness.get("ready")):
+            stt_label = f"OK ({_NATIVE_STT_LABELS[stt_provider]})"
     elif stt_enabled and _resolve_command_stt_provider_config(stt_provider, stt_config) is not None:
         stt_label = f"OK (command: {stt_provider})"
     elif stt_enabled and _check_plugin_stt_provider(stt_provider):
@@ -1529,6 +1588,9 @@ def check_voice_requirements() -> dict[str, Any]:
     ]
     details += [f"Environment: {w}" for w in env_check["warnings"]]
     details += [f"Environment: {n}" for n in env_check.get("notices", [])]
+    if stt_provider == "local_mlx" and mlx_readiness:
+        details += [f"MLX: {error}" for error in mlx_readiness.get("errors", [])]
+        details += [f"MLX: {warning}" for warning in mlx_readiness.get("warnings", [])]
     return {
         "available": has_audio and stt_available and env_check["available"],
         "audio_available": has_audio,
@@ -1536,6 +1598,7 @@ def check_voice_requirements() -> dict[str, Any]:
         "missing_packages": [] if has_audio else ["sounddevice", "numpy"],
         "details": "\n".join(details),
         "environment": env_check,
+        "stt_readiness": mlx_readiness,
     }
 
 
