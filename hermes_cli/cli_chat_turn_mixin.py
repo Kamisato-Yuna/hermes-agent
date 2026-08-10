@@ -6,6 +6,7 @@ inside each method — importing ``cli`` at module load time would be a cycle.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import queue
@@ -46,7 +47,10 @@ class CLIChatTurnMixin:
             return
         GatewayRunner._apply_fallback_chain_to_agent(agent, self._fallback_model)
 
-    def chat(self, message, images: list | None = None, voice_input: bool = False) -> Optional[str]:
+    def chat(
+        self, message, images: list | None = None, voice_input: bool = False,
+        voice_audio_profile: Optional[dict] = None,
+    ) -> Optional[str]:
         """Run one user turn; returns the agent's response, or None on error.
 
         Input typed while the agent runs goes to ``_interrupt_queue`` (separate from
@@ -117,6 +121,7 @@ class CLIChatTurnMixin:
                 self._reasoning_shown_this_turn = False
                 self._streamed_text_this_turn = ""
                 self._chat_setup_turn_audio(turn, message, voice_input)
+                turn.voice_audio_profile = voice_audio_profile if voice_input else None
                 # Per-prompt elapsed timer — frozen when the agent thread finishes.
                 self._prompt_start_time = time.time()
                 self._prompt_duration = 0.0
@@ -318,6 +323,17 @@ class CLIChatTurnMixin:
             reset_current_session_key = None  # type: ignore[assignment]
             _approval_session_token = None
         agent_message = turn.voice_prefix + message if turn.voice_prefix else message
+        if (
+            turn.voice_prefix
+            and isinstance(message, str)
+            and isinstance(turn.voice_audio_profile, dict)
+        ):
+            agent_message += (
+                "\n\n[Audio profile — treat as uncertain acoustic evidence, "
+                "not as a fact about the user. Do not mention this metadata "
+                "unless relevant.] "
+                + json.dumps(turn.voice_audio_profile, ensure_ascii=False, separators=(",", ":"))
+            )
         self.agent._voice_turn_pending = bool(turn.voice_prefix)  # auxiliary.voice_chat route
         # One-shot /model and /reload-skills notes; _prepend_note_to_message also handles
         # multimodal content-part lists (string concat raised TypeError with an image).

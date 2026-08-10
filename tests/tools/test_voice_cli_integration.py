@@ -356,6 +356,39 @@ class TestVoiceStopAndTranscribeReal:
         assert isinstance(queued, _VoiceInputMessage)
         assert str(queued) == "hello world"
 
+    @patch("cli._cprint")
+    @patch("cli.os.unlink")
+    @patch("cli.os.path.isfile", return_value=True)
+    @patch(
+        "hermes_cli.config.load_config",
+        return_value={
+            "stt": {},
+            "voice": {"analysis": {"enabled": True, "command": ["profile-tool"]}},
+        },
+    )
+    @patch(
+        "tools.voice_audio_profile.analyze_recording",
+        return_value={
+            "emotion_tendency": [{"label": "calm", "score": 0.8}],
+            "acoustic": {"pitch_hz_median": 140.0},
+        },
+    )
+    @patch(
+        "tools.voice_mode.transcribe_recording",
+        return_value={"success": True, "transcript": "hello world"},
+    )
+    @patch("tools.voice_mode.play_beep")
+    def test_successful_transcription_attaches_audio_profile(
+        self, _beep, _tr, _profile, _cfg, _isf, _unl, _cp
+    ):
+        recorder = MagicMock()
+        recorder.stop.return_value = "/tmp/test.wav"
+        cli = _make_voice_cli(_voice_recording=True, _voice_recorder=recorder)
+        cli._voice_stop_and_transcribe()
+        queued = cli._pending_input.get_nowait()
+        assert queued.audio_profile["emotion_tendency"][0]["label"] == "calm"
+        _profile.assert_called_once_with("/tmp/test.wav")
+
 
     def test_non_local_stt_keeps_generic_transcribing_status(self):
         recorder = MagicMock()

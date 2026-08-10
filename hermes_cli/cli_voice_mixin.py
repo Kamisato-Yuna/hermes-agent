@@ -190,7 +190,7 @@ class CLIVoiceMixin:
 
     def _voice_stop_and_transcribe(self):
         """Stop recording, transcribe via STT, and queue the transcript as input."""
-        from cli import _DIM, _RST, _VoiceInputMessage, _cprint
+        from cli import _DIM, _RST, _VoiceInputMessage, _cprint, logger
         # Atomic guard; _voice_processing is set immediately so concurrent Ctrl+B presses
         # don't race into the START path while recorder.stop() holds its lock.
         with self._voice_lock:
@@ -229,7 +229,13 @@ class CLIVoiceMixin:
                     return
                 self._attached_images.clear()
                 self._voice_invalidate()
-                self._pending_input.put(_VoiceInputMessage(transcript))
+                audio_profile = None
+                try:
+                    from tools.voice_audio_profile import analyze_recording
+                    audio_profile = analyze_recording(wav_path)
+                except Exception:
+                    logger.exception("Voice audio profile hook failed; continuing with transcript")
+                self._pending_input.put(_VoiceInputMessage(transcript, audio_profile))
                 submitted = True
             elif result.get("success"):
                 _cprint(f"{_DIM}{t('cli.voice.no_speech')}{_RST}")
@@ -462,7 +468,13 @@ class CLIVoiceMixin:
                             "Dropping playback-phase barge transcript as TTS echo: %r", transcript)
                         _cprint(f"\n{_DIM}{t('cli.voice.echo_ignored')}{_RST}")
                         return
-                self._pending_input.put(_VoiceInputMessage(transcript))
+                audio_profile = None
+                try:
+                    from tools.voice_audio_profile import analyze_recording
+                    audio_profile = analyze_recording(wav_path)
+                except Exception:
+                    logger.exception("Voice audio profile hook failed; continuing with transcript")
+                self._pending_input.put(_VoiceInputMessage(transcript, audio_profile))
                 submitted = True
             elif not result.get("success"):
                 _cprint(f"\n{_DIM}{t('cli.voice.transcription_failed', error=result.get('error') or t('cli.shared.unknown_error'))}{_RST}")
