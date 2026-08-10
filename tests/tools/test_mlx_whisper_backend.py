@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import wave
 from types import SimpleNamespace
@@ -266,6 +267,54 @@ def test_local_mlx_prewarm_uses_a_temporary_non_silent_wav(monkeypatch):
     assert result["prewarm"] is True
     assert captured["path"].endswith(".wav")
     assert captured["peak"] > 0
+
+
+def test_local_mlx_worker_start_prewarm_and_cleans_temporary_audio(monkeypatch, tmp_path):
+    from tools import mlx_whisper_client
+
+    monkeypatch.setattr(
+        transcription_mlx,
+        "check_local_mlx_requirements",
+        lambda cfg: {"ready": True, "model": "test-model"},
+    )
+    captured = {}
+
+    class FakeWorker:
+        def __init__(self, **kwargs):
+            captured["kwargs"] = kwargs
+            self.pid = 4321
+            self.is_running = False
+
+        def start(self):
+            self.is_running = True
+            return self
+
+        def warmup(self, path):
+            captured["warmup_path"] = path
+            return {"success": True, "prewarm": True}
+
+        def stop(self):
+            self.is_running = False
+
+    monkeypatch.setattr(mlx_whisper_client, "MLXWhisperWorker", FakeWorker)
+    worker, status = tt.start_local_mlx_worker(
+        {
+            "provider": "local_mlx",
+            "mlx": {
+                "python": sys.executable,
+                "model": "test-model",
+                "language": "zh",
+                "task": "transcribe",
+            },
+        },
+        prewarm=True,
+    )
+
+    assert worker is not None
+    assert status["success"] is True
+    assert status["worker_pid"] == 4321
+    assert captured["kwargs"]["model"] == "test-model"
+    assert not os.path.exists(captured["warmup_path"])
 
 
 def test_local_mlx_splits_long_wav_and_preserves_timeline(monkeypatch, tmp_path):

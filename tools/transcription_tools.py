@@ -39,7 +39,8 @@ from tools.transcription_local import (
     build_local_transcribe_kwargs)
 from tools.transcription_mlx import (
     _transcribe_local_mlx, _transcribe_local_mlx_with_segments,
-    check_local_mlx_requirements, prewarm_local_mlx)
+    check_local_mlx_requirements, prewarm_local_mlx,
+    start_local_mlx_worker, stop_local_mlx_worker)
 # The ``_transcribe_<provider>`` handlers are looked up in this module's globals by _dispatch_stt_provider.
 from tools.transcription_cloud import (
     _has_xai_stt_credentials, _resolve_openai_audio_client_config, _transcribe_deepinfra,
@@ -444,6 +445,7 @@ def _transcribe_prepared_audio(
     source: Optional[str] = None,
     *,
     cancel_event: Optional[threading.Event] = None,
+    mlx_worker: Optional[Any] = None,
 ) -> dict[str, Any]:
     """Transcribe a validated audio file with the configured STT provider. ``model`` overrides the
     config default; ``source`` is a caller-surface label (``"gateway"``, ``"voice_mode"``) forwarded
@@ -479,7 +481,14 @@ def _transcribe_prepared_audio(
                 return transcribe_oversized(
                     file_path, limit, lambda part: _route_stt_provider(part, provider, stt_config, *hints))
         return _dispatch_stt_provider(
-            file_path, provider, stt_config, model, source, cancel_event=cancel_event)
+            file_path,
+            provider,
+            stt_config,
+            model,
+            source,
+            cancel_event=cancel_event,
+            mlx_worker=mlx_worker,
+        )
 
 
 def _limit_model_name(provider: str, stt_config: dict[str, Any], model: Optional[str]) -> Optional[str]:
@@ -528,18 +537,21 @@ def _resolve_dispatch_hints(
 
 def _dispatch_stt_provider(
     file_path: str, provider: str, stt_config: dict[str, Any], model: Optional[str] = None,
-    source: Optional[str] = None, *, cancel_event: Optional[threading.Event] = None) -> dict[str, Any]:
+    source: Optional[str] = None, *, cancel_event: Optional[threading.Event] = None,
+    mlx_worker: Optional[Any] = None) -> dict[str, Any]:
     """Route *file_path* to the handler for *provider* (built-in > command > plugin)."""
     return _route_stt_provider(
         file_path, provider, stt_config,
         *_resolve_dispatch_hints(file_path, provider, stt_config, model, source),
-        cancel_event=cancel_event)
+        cancel_event=cancel_event,
+        mlx_worker=mlx_worker)
 
 
 def _route_stt_provider(
     file_path: str, provider: str, stt_config: dict[str, Any], model: Optional[str],
     language: Optional[str], prompt: Optional[str], *,
-    cancel_event: Optional[threading.Event] = None) -> dict[str, Any]:
+    cancel_event: Optional[threading.Event] = None,
+    mlx_worker: Optional[Any] = None) -> dict[str, Any]:
     if provider == "local_mlx":
         mlx_cfg = _get_stt_section(stt_config, "mlx")
         mlx_language = (
@@ -548,7 +560,8 @@ def _route_stt_provider(
         )
         return _transcribe_local_mlx_with_segments(
             file_path, _builtin_model_name(provider, stt_config, model), mlx_cfg,
-            language=mlx_language, prompt=prompt, cancel_event=cancel_event)
+            language=mlx_language, prompt=prompt, cancel_event=cancel_event,
+            mlx_worker=mlx_worker)
     if provider in BUILTIN_STT_PROVIDERS:
         # Looked up in this module at call time so tests may patch ``_transcribe_*``.
         handler = globals()[f"_transcribe_{provider}"]
@@ -596,6 +609,7 @@ def transcribe_audio(
     source: Optional[str] = None,
     *,
     cancel_event: Optional[threading.Event] = None,
+    mlx_worker: Optional[Any] = None,
 ) -> dict[str, Any]:
     """Validate, preprocess supported inputs, and dispatch transcription. ``source`` is a caller-surface
     label (``"gateway"``, ``"voice_mode"``) forwarded to the ``pre_transcription`` hook only."""
@@ -615,7 +629,8 @@ def transcribe_audio(
     try:
         return (_validate_audio_file(prepared_path, enforce_size_limit=False)
                 or _transcribe_prepared_audio(
-                    prepared_path, model, source, cancel_event=cancel_event))
+                    prepared_path, model, source, cancel_event=cancel_event,
+                    mlx_worker=mlx_worker))
     finally:
         if cleanup_dir:
             shutil.rmtree(cleanup_dir, ignore_errors=True)

@@ -999,6 +999,7 @@ def transcribe_recording(
     model: Optional[str] = None,
     *,
     cancel_event: Optional[threading.Event] = None,
+    mlx_worker: Optional[Any] = None,
 ) -> dict[str, Any]:
     """Transcribe a WAV via ``transcribe_audio()``, filtering Whisper hallucinations;
     returns ``{success, transcript[, error]}``."""
@@ -1008,7 +1009,12 @@ def transcribe_recording(
     if result is None:
         # transcribe_audio fits oversized recordings under the provider's upload cap itself.
         result = transcribe_audio(
-            wav_path, model=model, source="voice_mode", cancel_event=cancel_event)
+            wav_path,
+            model=model,
+            source="voice_mode",
+            cancel_event=cancel_event,
+            mlx_worker=mlx_worker,
+        )
     # A configured stop phrase always survives: "bye"/"okay" overlap the
     # hallucination blocklist, and swallowing them would make "bye" fail to end the chat.
     if result.get("success"):

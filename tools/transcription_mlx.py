@@ -30,6 +30,7 @@ def _transcribe_local_mlx(
     language: Optional[str] = None,
     prompt: Optional[str] = None,
     cancel_event: Optional[threading.Event] = None,
+    mlx_worker: Optional[Any] = None,
 ) -> dict[str, Any]:
     """Transcribe through the user's separate MLX Whisper Python environment."""
     python_path = str(mlx_cfg.get("python") or "").strip()
@@ -55,6 +56,20 @@ def _transcribe_local_mlx(
         )
     if not runner.is_file():
         return _mlx_configuration_error(f"MLX runner is missing: {runner}")
+
+    if mlx_worker is not None:
+        from tools.mlx_whisper_client import MLXWhisperWorkerError
+
+        try:
+            worker_result = mlx_worker.transcribe(file_path, cancel_event=cancel_event)
+        except MLXWhisperWorkerError as exc:
+            logger.warning("MLX worker transport failed; falling back to one-shot runner: %s", exc)
+        else:
+            if isinstance(worker_result, dict):
+                worker_result.setdefault("provider", "local_mlx")
+                worker_result.setdefault("language", language)
+                worker_result.setdefault("task", "transcribe")
+                return worker_result
 
     timeout = max(
         1.0,
@@ -343,6 +358,32 @@ def check_local_mlx_requirements(
     }
 
 
+def _create_mlx_warmup_wav() -> str:
+    """Create a short non-silent WAV used only to load the MLX model."""
+    fd, warmup_path = tempfile.mkstemp(prefix="hermes-mlx-warmup-", suffix=".wav")
+    os.close(fd)
+    try:
+        sample_rate = 16000
+        sample_count = int(sample_rate * 0.4)
+        amplitude = 3000
+        with wave.open(warmup_path, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(sample_rate)
+            frames = bytearray()
+            for index in range(sample_count):
+                sample = int(amplitude * math.sin(2 * math.pi * 440 * index / sample_rate + math.pi / 2))
+                frames.extend(sample.to_bytes(2, "little", signed=True))
+            wav_file.writeframes(frames)
+        return warmup_path
+    except Exception:
+        try:
+            os.unlink(warmup_path)
+        except OSError:
+            pass
+        raise
+
+
 def prewarm_local_mlx(stt_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Load the MLX model with a temporary tone before voice capture begins."""
     if stt_config is None:
@@ -360,21 +401,8 @@ def prewarm_local_mlx(stt_config: Optional[Dict[str, Any]] = None) -> Dict[str, 
     raw_mlx_cfg = stt_config.get("mlx")
     mlx_cfg = raw_mlx_cfg if isinstance(raw_mlx_cfg, dict) else {}
     model_name = str(mlx_cfg.get("model") or DEFAULT_MLX_MODEL)
-    fd, warmup_path = tempfile.mkstemp(prefix="hermes-mlx-warmup-", suffix=".wav")
-    os.close(fd)
+    warmup_path = _create_mlx_warmup_wav()
     try:
-        sample_rate = 16000
-        sample_count = int(sample_rate * 0.4)
-        amplitude = 3000
-        with wave.open(warmup_path, "wb") as wav_file:
-            wav_file.setnchannels(1)
-            wav_file.setsampwidth(2)
-            wav_file.setframerate(sample_rate)
-            frames = bytearray()
-            for index in range(sample_count):
-                sample = int(amplitude * math.sin(2 * math.pi * 440 * index / sample_rate + math.pi / 2))
-                frames.extend(sample.to_bytes(2, "little", signed=True))
-            wav_file.writeframes(frames)
         result = _transcribe_local_mlx(warmup_path, model_name, mlx_cfg)
         result = dict(result)
         result.update(prewarm=True, transcript="", text="")
@@ -389,6 +417,98 @@ def prewarm_local_mlx(stt_config: Optional[Dict[str, Any]] = None) -> Dict[str, 
             os.unlink(warmup_path)
         except OSError:
             pass
+
+
+def start_local_mlx_worker(
+    stt_config: Optional[Dict[str, Any]] = None,
+    *,
+    prewarm: bool = True,
+) -> tuple[Optional[Any], Dict[str, Any]]:
+    """Start a Voice Mode scoped MLX worker and optionally load its model."""
+    if stt_config is None:
+        from tools.transcription_tools import _load_stt_config
+        stt_config = _load_stt_config()
+    stt_config = stt_config if isinstance(stt_config, dict) else {}
+    readiness = check_local_mlx_requirements(stt_config)
+    if not readiness.get("ready"):
+        errors = "; ".join(readiness.get("errors") or ["MLX runtime is not ready"])
+        return None, {
+            "success": False,
+            "provider": "local_mlx",
+            "error_type": "readiness",
+            "error": errors,
+        }
+
+    raw_mlx_cfg = stt_config.get("mlx")
+    mlx_cfg = raw_mlx_cfg if isinstance(raw_mlx_cfg, dict) else {}
+    worker_script = Path(__file__).with_name("mlx_whisper_worker.py")
+    if not worker_script.is_file():
+        return None, {
+            "success": False,
+            "provider": "local_mlx",
+            "error_type": "configuration",
+            "error": f"MLX worker script is missing: {worker_script}",
+        }
+
+    from tools.mlx_whisper_client import MLXWhisperWorker, MLXWhisperWorkerError
+
+    worker = None
+    try:
+        worker = MLXWhisperWorker(
+            python_path=readiness["python"],
+            model=readiness["model"],
+            runner_path=str(worker_script),
+            mlx_config=mlx_cfg,
+            timeout_seconds=_mlx_float_config(
+                mlx_cfg, "timeout_seconds", DEFAULT_MLX_TIMEOUT_SECONDS,
+            ),
+        )
+        worker.start()
+        warmup_result: Dict[str, Any] = {"success": True}
+        if prewarm:
+            warmup_path = _create_mlx_warmup_wav()
+            try:
+                warmup_result = worker.warmup(warmup_path)
+            finally:
+                try:
+                    os.unlink(warmup_path)
+                except OSError:
+                    pass
+            if not warmup_result.get("success"):
+                worker.stop()
+                return None, {
+                    "success": False,
+                    "provider": "local_mlx",
+                    "error_type": warmup_result.get("error_type", "runtime"),
+                    "error": warmup_result.get("error", "MLX worker prewarm failed"),
+                }
+        return worker, {
+            "success": True,
+            "provider": "local_mlx",
+            "worker": True,
+            "worker_pid": worker.pid,
+            "prewarm": prewarm,
+            "prewarm_result": warmup_result,
+        }
+    except (MLXWhisperWorkerError, OSError, ValueError) as exc:
+        if worker is not None:
+            worker.stop()
+        return None, {
+            "success": False,
+            "provider": "local_mlx",
+            "error_type": "worker",
+            "error": f"MLX worker failed: {exc}",
+        }
+
+
+def stop_local_mlx_worker(worker: Any) -> None:
+    """Stop a Voice Mode MLX worker without allowing cleanup errors to escape."""
+    if worker is None:
+        return
+    try:
+        worker.stop()
+    except Exception:
+        logger.debug("MLX worker cleanup failed", exc_info=True)
 
 
 class _MLXTranscriptionCancelled(Exception):
@@ -534,13 +654,14 @@ def _transcribe_local_mlx_with_segments(
     language: Optional[str] = None,
     prompt: Optional[str] = None,
     cancel_event: Optional[threading.Event] = None,
+    mlx_worker: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Transcribe long WAVs in bounded MLX chunks and merge their text."""
     max_seconds = _mlx_float_config(mlx_cfg, "max_segment_seconds", 60.0)
     if max_seconds <= 0:
         return _transcribe_local_mlx(
             file_path, model_name, mlx_cfg, language=language, prompt=prompt,
-            cancel_event=cancel_event,
+            cancel_event=cancel_event, mlx_worker=mlx_worker,
         )
     duration_params = _wav_duration_and_params(file_path)
     estimated_duration = (
@@ -549,7 +670,7 @@ def _transcribe_local_mlx_with_segments(
     if estimated_duration is None or estimated_duration <= max_seconds:
         return _transcribe_local_mlx(
             file_path, model_name, mlx_cfg, language=language, prompt=prompt,
-            cancel_event=cancel_event,
+            cancel_event=cancel_event, mlx_worker=mlx_worker,
         )
     if Path(file_path).suffix.lower() != ".wav":
         return {
@@ -580,10 +701,14 @@ def _transcribe_local_mlx_with_segments(
                     "error": "MLX Whisper transcription was cancelled",
                     "completed_chunks": index,
                 }
-            result = _transcribe_local_mlx(
-                chunk_path, model_name, mlx_cfg, language=language, prompt=prompt,
-                cancel_event=cancel_event,
-            )
+            transcribe_kwargs = {
+                "language": language,
+                "prompt": prompt,
+                "cancel_event": cancel_event,
+            }
+            if mlx_worker is not None:
+                transcribe_kwargs["mlx_worker"] = mlx_worker
+            result = _transcribe_local_mlx(chunk_path, model_name, mlx_cfg, **transcribe_kwargs)
             if not result.get("success"):
                 return {
                     "success": False,

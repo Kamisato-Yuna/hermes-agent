@@ -32,6 +32,7 @@ def _make_voice_cli(**overrides):
     cli._voice_tts_done = threading.Event()
     cli._voice_tts_done.set()
     cli._voice_tts_stop = None
+    cli._voice_mlx_worker = None
     cli._voice_barge_capture = threading.Event()
     cli._voice_last_tts_text = ""
     cli._voice_barge_phase = None
@@ -140,8 +141,8 @@ class TestEnableVoiceModeReal:
 
     @patch("cli._cprint")
     @patch(
-        "tools.transcription_tools.prewarm_local_mlx",
-        return_value={"success": True, "prewarm": True},
+        "tools.transcription_tools.start_local_mlx_worker",
+        return_value=("worker-handle", {"success": True, "prewarm": True, "worker_pid": 123}),
     )
     @patch(
         "hermes_cli.config.load_config",
@@ -168,14 +169,15 @@ class TestEnableVoiceModeReal:
         },
     )
     @patch("tools.voice_mode.detect_audio_environment", return_value={"available": True, "warnings": []})
-    def test_local_mlx_is_pre_warmed_before_enable(
-        self, _env, _req, _cfg, mock_prewarm, _cp
+    def test_local_mlx_worker_starts_before_enable(
+        self, _env, _req, _cfg, mock_worker, _cp
     ):
         cli = _make_voice_cli()
         cli._enable_voice_mode()
         assert cli._voice_mode is True
-        mock_prewarm.assert_called_once()
-        assert mock_prewarm.call_args.args[0]["provider"] == "local_mlx"
+        mock_worker.assert_called_once()
+        assert mock_worker.call_args.args[0]["provider"] == "local_mlx"
+        assert cli._voice_mlx_worker == "worker-handle"
 
 
 class TestVoiceBeepConfigReal:
@@ -284,6 +286,17 @@ class TestDisableVoiceModeReal:
         assert cli._voice_mode is False
         assert cli._voice_tts is False
         assert cli._voice_continuous is False
+
+    @patch("cli._cprint")
+    @patch("tools.transcription_tools.stop_local_mlx_worker")
+    @patch("tools.voice_mode.stop_playback")
+    def test_disable_stops_voice_scoped_mlx_worker(self, _sp, mock_stop_worker, _cp):
+        worker = MagicMock()
+        cli = _make_voice_cli(_voice_mode=True, _voice_mlx_worker=worker)
+        cli._disable_voice_mode()
+        mock_stop_worker.assert_called_once_with(worker)
+        assert cli._voice_mlx_worker is None
+        assert cli._voice_stt_cancel.is_set()
 
 
     @patch("cli._cprint")
@@ -453,6 +466,24 @@ class TestVoiceStopAndTranscribeReal:
             model="whisper-1",
             cancel_event=None,
         )
+
+    @patch("cli._cprint")
+    @patch("cli.os.path.isfile", return_value=False)
+    @patch("tools.voice_mode.transcribe_recording", return_value={"success": True, "transcript": "late text"})
+    def test_cancel_event_drops_late_worker_result(self, mock_transcribe, _isf, _cp):
+        recorder = MagicMock()
+        recorder.stop.return_value = "/tmp/test.wav"
+        cancel_event = threading.Event()
+        cancel_event.set()
+        cli = _make_voice_cli(
+            _voice_recording=True,
+            _voice_recorder=recorder,
+            _voice_stt_cancel=cancel_event,
+        )
+        cli._voice_stop_and_transcribe()
+        assert cli._pending_input.empty()
+        assert any("cancelled" in call.args[0].lower() for call in _cp.call_args_list)
+        mock_transcribe.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
