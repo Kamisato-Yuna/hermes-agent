@@ -39,5 +39,5 @@ voice:
     timeout_seconds: 15
 ```
 
-The current helper must be adapted to write JSON to the supplied output path;
-Hermes does not interpret human-readable stdout as an audio profile.
+The helper writes the JSON profile to the supplied output path; no stdout
+parsing is required.
