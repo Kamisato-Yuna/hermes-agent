@@ -66,9 +66,12 @@ RETIRED_GROQ_MODELS = frozenset({"distil-whisper-large-v3-en"})
 # The plugin hook from issue #30398-style follow-up rejects plugins registering under any of these names;
 # the dispatcher in ``transcribe_audio`` short-circuits them defensively as well.
 BUILTIN_STT_PROVIDERS = frozenset({
-    "local", "local_command", "groq", "openai", "mistral", "xai", "elevenlabs", "deepinfra"})
+    "local", "local_command", "local_mlx", "groq", "openai", "mistral", "xai",
+    "elevenlabs", "deepinfra",
+})
+LOCAL_STT_PROVIDERS = frozenset({"local", "local_command", "local_mlx"})
 # Built-in providers that upload audio to a remote API.
-CLOUD_STT_PROVIDERS = frozenset(BUILTIN_STT_PROVIDERS - {"local", "local_command"})
+CLOUD_STT_PROVIDERS = frozenset(BUILTIN_STT_PROVIDERS - LOCAL_STT_PROVIDERS)
 
 
 def _error_result(error: str, **extra: Any) -> dict[str, Any]:

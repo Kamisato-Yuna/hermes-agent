@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Speech-to-text transcription used by the gateway for voice messages.
 
-Built-in providers: local (faster-whisper, default/free), local_command, groq, openai
-(also serves the managed ``nous`` selection), mistral, xai, elevenlabs, deepinfra; plus
+Built-in providers: local (faster-whisper, default/free), local_command, local_mlx, groq,
+openai (also serves the managed ``nous`` selection), mistral, xai, elevenlabs, deepinfra; plus
 user-declared command providers and plugin providers. ``transcribe_audio(path)`` returns
 ``{"success", "transcript", "error"?, "provider"?}``. This module owns provider resolution,
 the dispatcher and the cached local model + idle-unload state; backends live in
@@ -23,7 +23,8 @@ from typing import Optional, Dict, Any
 
 from utils import is_truthy_value
 from tools.transcription_common import (
-    BUILTIN_STT_PROVIDERS, CLOUD_STT_PROVIDERS, DEFAULT_ELEVENLABS_STT_MODEL,
+    BUILTIN_STT_PROVIDERS, CLOUD_STT_PROVIDERS, LOCAL_STT_PROVIDERS,
+    DEFAULT_ELEVENLABS_STT_MODEL,
     DEFAULT_GROQ_STT_MODEL, DEFAULT_LOCAL_MODEL, DEFAULT_MISTRAL_STT_MODEL, DEFAULT_PROVIDER,
     DEFAULT_STT_MODEL, LOCAL_STT_COMMAND_ENV, LOCAL_STT_LANGUAGE_ENV,
     normalize_xai_stt_model, _error_result, _get_stt_section, _ok_result)
@@ -36,6 +37,7 @@ from tools.transcription_local import (
     _load_local_whisper_model, _looks_like_cuda_lib_error, _normalize_local_model,
     _normalize_local_stt_language, _transcribe_local_command, _try_lazy_install_stt,
     build_local_transcribe_kwargs)
+from tools.transcription_mlx import _transcribe_local_mlx
 # The ``_transcribe_<provider>`` handlers are looked up in this module's globals by _dispatch_stt_provider.
 from tools.transcription_cloud import (
     _has_xai_stt_credentials, _resolve_openai_audio_client_config, _transcribe_deepinfra,
@@ -132,7 +134,7 @@ def _has_openai_audio_backend() -> bool:
 
 def _is_local_stt_provider(provider: str, stt_config: dict[str, Any]) -> bool:
     """Whether *provider* is exempt from Hermes's remote upload cap."""
-    return (provider or "").lower().strip() in {"local", "local_command"}
+    return (provider or "").lower().strip() in LOCAL_STT_PROVIDERS
 
 
 # ---- Provider resolution ------------------------------------------------
@@ -266,6 +268,15 @@ def _get_provider(stt_config: dict) -> str:
         except Exception:  # pragma: no cover — helpers are in-repo
             pass
     if explicit:
+        if provider == "local_mlx":
+            mlx_cfg = _get_stt_section(stt_config, "mlx")
+            python_path = str(mlx_cfg.get("python") or "").strip()
+            if python_path and Path(python_path).is_file():
+                return "local_mlx"
+            logger.warning(
+                "STT provider 'local_mlx' configured but mlx.python is missing or invalid"
+            )
+            return "none"
         return _resolve_explicit_provider(provider)
     backend = _detect_local_backend()
     if backend:
@@ -478,6 +489,7 @@ def _limit_model_name(provider: str, stt_config: dict[str, Any], model: Optional
 _BUILTIN_MODEL_KEYS = {
     "local": ("local", "model", DEFAULT_LOCAL_MODEL, False),
     "local_command": ("local", "model", DEFAULT_LOCAL_MODEL, False),
+    "local_mlx": ("mlx", "model", "mlx-community/whisper-large-v3-mlx", False),
     "groq": ("groq", "model", DEFAULT_GROQ_STT_MODEL, True),
     "openai": ("openai", "model", DEFAULT_STT_MODEL, False),
     "mistral": ("mistral", "model", DEFAULT_MISTRAL_STT_MODEL, False),
@@ -522,6 +534,15 @@ def _dispatch_stt_provider(
 def _route_stt_provider(
     file_path: str, provider: str, stt_config: dict[str, Any], model: Optional[str],
     language: Optional[str], prompt: Optional[str]) -> dict[str, Any]:
+    if provider == "local_mlx":
+        mlx_cfg = _get_stt_section(stt_config, "mlx")
+        mlx_language = (
+            language or mlx_cfg.get("language")
+            or _resolve_stt_language("local_mlx", stt_config) or "zh"
+        )
+        return _transcribe_local_mlx(
+            file_path, _builtin_model_name(provider, stt_config, model), mlx_cfg,
+            language=mlx_language, prompt=prompt)
     if provider in BUILTIN_STT_PROVIDERS:
         # Looked up in this module at call time so tests may patch ``_transcribe_*``.
         handler = globals()[f"_transcribe_{provider}"]

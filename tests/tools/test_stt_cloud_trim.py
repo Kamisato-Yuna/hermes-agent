@@ -85,7 +85,9 @@ class TestProviderGating:
     def test_cloud_set_covers_every_remote_builtin(self):
         # Invariant: every built-in that is not local-ish uploads audio and
         # must get the trim. New built-ins are cloud unless proven otherwise.
-        assert CLOUD_STT_PROVIDERS == BUILTIN_STT_PROVIDERS - {"local", "local_command"}
+        assert CLOUD_STT_PROVIDERS == BUILTIN_STT_PROVIDERS - {
+            "local", "local_command", "local_mlx",
+        }
 
     def test_local_provider_never_trims(self, tmp_path):
         wav = _write_wav(tmp_path / "a.wav", [("tone", 1)])

@@ -1488,6 +1488,7 @@ def _check_plugin_stt_provider(provider: str) -> bool:
 _NATIVE_STT_LABELS = {
     "local": "local faster-whisper",
     "local_command": "local command",
+    "local_mlx": "local MLX Whisper",
     "groq": "Groq",
     "openai": "OpenAI",
     "mistral": "Mistral Voxtral",
