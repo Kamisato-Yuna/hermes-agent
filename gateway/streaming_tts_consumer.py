@@ -73,9 +73,17 @@ class StreamingTTSConsumer:
         self._loop = loop
         self._metadata = metadata
 
-        # Resolve the streaming provider once. If unavailable, the consumer is
-        # inactive and the gateway falls back to whole-file TTS.
-        self._streamer = resolve_streaming_provider(tts_config)
+        # Semantic rewriting needs the complete assistant reply. Keep this
+        # consumer inactive in that mode so the gateway falls back to the
+        # whole-file path, where text_to_speech_tool can run the rewrite once.
+        from tools.tts_spoken_script import spoken_rewrite_enabled
+        spoken_cfg = tts_config.get("spoken_rewrite") if isinstance(tts_config, dict) else None
+        if spoken_rewrite_enabled(spoken_cfg):
+            self._streamer = None
+        else:
+            # Resolve the streaming provider once. If unavailable, the consumer
+            # is inactive and the gateway falls back to whole-file TTS.
+            self._streamer = resolve_streaming_provider(tts_config)
         self._chunker = SentenceChunker()
 
         if self._streamer is not None:

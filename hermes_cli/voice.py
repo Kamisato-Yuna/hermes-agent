@@ -967,8 +967,13 @@ def speak_text(text: str, stop_event: Optional[threading.Event] = None) -> None:
         try:
             from tools.tts_streaming import resolve_streaming_provider
             from tools.tts_tool import _load_tts_config
+            from tools.tts_spoken_script import spoken_rewrite_enabled
 
-            if resolve_streaming_provider(_load_tts_config()) is not None:
+            tts_config = _load_tts_config()
+            if (
+                not spoken_rewrite_enabled(tts_config.get("spoken_rewrite"))
+                and resolve_streaming_provider(tts_config) is not None
+            ):
                 if _speak_text_streaming(text, stop_event):
                     return
         except Exception as e:
@@ -978,8 +983,22 @@ def speak_text(text: str, stop_event: Optional[threading.Event] = None) -> None:
         # ⋗ blocks, verifier footer, units, newline flattening.
         # The TTS tool owns provider request limits and long-form chunking.
         try:
-            from tools.tts_text_normalize import prepare_spoken_text
-            tts_text = prepare_spoken_text(text, max_chars=None)
+            from tools.tts_spoken_script import spoken_rewrite_enabled
+            from tools.tts_tool import _load_tts_config
+
+            _tts_cfg = _load_tts_config()
+            _spoken_cfg = (
+                _tts_cfg.get("spoken_rewrite")
+                if isinstance(_tts_cfg, dict)
+                else None
+            )
+            if spoken_rewrite_enabled(_spoken_cfg):
+                # The semantic pass needs the complete assistant reply;
+                # text_to_speech_tool owns rewriting and the safety gate.
+                tts_text = str(text or "").strip()
+            else:
+                from tools.tts_text_normalize import prepare_spoken_text
+                tts_text = prepare_spoken_text(text, max_chars=None)
         except Exception:
             # Legacy fallback pipeline — keep speak_text best-effort.
             tts_text = re.sub(r'```[\s\S]*?```', ' ', text)             # fenced code blocks

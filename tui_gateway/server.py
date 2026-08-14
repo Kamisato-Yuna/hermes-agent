@@ -13129,8 +13129,16 @@ def _tts_stream_begin() -> Optional[queue.Queue]:
     if not _voice_tts_enabled():
         return None
     try:
-        from tools.tts_tool import check_tts_requirements, stream_tts_to_speaker
+        from tools.tts_tool import _load_tts_config, check_tts_requirements, stream_tts_to_speaker
+        from tools.tts_spoken_script import spoken_rewrite_enabled
 
+        _tts_cfg = _load_tts_config()
+        _spoken_cfg = _tts_cfg.get("spoken_rewrite") if isinstance(_tts_cfg, dict) else None
+        if spoken_rewrite_enabled(_spoken_cfg):
+            logger.info(
+                "TUI streaming TTS disabled: semantic spoken rewrite waits for full reply"
+            )
+            return None
         if not check_tts_requirements():
             return None
     except Exception:

@@ -3517,17 +3517,48 @@ def text_to_speech_tool(
     if not text or not text.strip():
         return tool_error("Text is required", success=False)
 
-    # Normalize text via the shared cleaner: markdown, emoji, think blocks,
-    # verifier footer, units, newline flattening.
-    try:
-        from tools.tts_text_normalize import prepare_spoken_text
-        text = prepare_spoken_text(text, max_chars=None)
-    except Exception:
-        text = text.strip()
+    tts_config = _load_tts_config()
+    original_input_chars = len(str(text or ""))
+
+    # Semantic spoken-script mode is deliberately owned by the whole-file
+    # boundary.  It sees the complete reply once, then the ordinary cleaner and
+    # provider-specific chunking handle the already-safe script.  Streaming
+    # callers are gated off separately when this option is enabled.
+    spoken_rewrite = tts_config.get("spoken_rewrite")
+    from tools.tts_spoken_script import spoken_rewrite_enabled
+    if spoken_rewrite_enabled(spoken_rewrite if isinstance(spoken_rewrite, dict) else None):
+        try:
+            from tools.tts_spoken_script import prepare_spoken_script
+            spoken_result = prepare_spoken_script(
+                text,
+                config=spoken_rewrite,
+            )
+            text = spoken_result.spoken_text
+            logger.info(
+                "TTS spoken rewrite request=%s status=%s rewrite_used=%s fallback_used=%s "
+                "input_chars=%d output_chars=%d",
+                spoken_result.request_id,
+                spoken_result.status,
+                spoken_result.rewrite_used,
+                spoken_result.fallback_used,
+                original_input_chars,
+                len(text or ""),
+            )
+        except Exception as exc:
+            # The semantic layer is fail-closed: a rewrite implementation error
+            # must never expose the raw assistant reply to a speech provider.
+            logger.warning("TTS spoken rewrite failed closed: %s", exc)
+            from tools.tts_spoken_script import SPOKEN_FAILURE_NOTICE
+            text = SPOKEN_FAILURE_NOTICE
+    else:
+        # Disabled mode preserves the existing deterministic cleaner.
+        try:
+            from tools.tts_text_normalize import prepare_spoken_text
+            text = prepare_spoken_text(text, max_chars=None)
+        except Exception:
+            text = text.strip()
     if not text:
         return tool_error("Text is empty after TTS cleanup", success=False)
-
-    tts_config = _load_tts_config()
 
     # When the model supplies a speed parameter, inject it into the config
     # so all downstream provider functions pick it up uniformly.
@@ -4012,6 +4043,16 @@ def stream_tts_to_speaker(
         _audio_queue = None  # type: ignore[assignment]
         _prefetch_threads = []
         tts_config = _load_tts_config()
+
+        # Semantic rewriting needs the complete assistant reply.  This bottom
+        # gate is deliberately redundant with the CLI/gateway gates: if a
+        # caller reaches the sentence consumer directly, it must still fail
+        # closed instead of speaking a partial raw reply.
+        from tools.tts_spoken_script import spoken_rewrite_enabled
+        spoken_cfg = tts_config.get("spoken_rewrite") if isinstance(tts_config, dict) else None
+        if spoken_rewrite_enabled(spoken_cfg):
+            logger.info("Streaming TTS skipped: semantic spoken rewrite waits for the full turn")
+            return
 
         # Prefer a chunked streamer for low time-to-first-audio; fall back to
         # per-sentence sync synthesis (universal — edge + every non-streamer).

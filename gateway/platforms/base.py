@@ -4475,12 +4475,31 @@ class BasePlatformAdapter(ABC):
         by the TTS tool.
         """
         try:
+            from tools.tts_spoken_script import spoken_rewrite_enabled
+            from tools.tts_tool import _load_tts_config
+
+            tts_config = _load_tts_config()
+            spoken_cfg = (
+                tts_config.get("spoken_rewrite")
+                if isinstance(tts_config, dict)
+                else None
+            )
+            if spoken_rewrite_enabled(spoken_cfg):
+                # The semantic layer must see the complete assistant reply,
+                # including Markdown and technical context.  The whole-file
+                # TTS entry point owns the rewrite and the final safety gate.
+                return str(text or "").strip()
+
             from tools.tts_text_normalize import prepare_spoken_text
             return prepare_spoken_text(text, max_chars=None)
         except Exception:
             # Keep auto-TTS best-effort if the normalizer ever fails.
-            text = re.sub(r'<think[\s>].*?</think>', ' ', text, flags=re.DOTALL)
-            return re.sub(r'[*_`#\[\]()]', '', text).strip()
+            try:
+                from tools.tts_text_normalize import prepare_spoken_text
+                return prepare_spoken_text(text, max_chars=None)
+            except Exception:
+                text = re.sub(r'<think[\s>].*?</think>', ' ', text, flags=re.DOTALL)
+                return re.sub(r'[*_`#\[\]()]', '', text).strip()
 
     async def play_tts(
         self,

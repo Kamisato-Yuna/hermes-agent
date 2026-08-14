@@ -1004,6 +1004,20 @@ DEFAULT_CONFIG = {
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
         },
+        # Semantic rewrite for the TTS spoken artifact.  The visible assistant
+        # reply remains unchanged; this task only produces a bounded Chinese
+        # script for the speech provider.  The explicit internal route is
+        # intentionally cheap/fast, while the caller can still fall back to
+        # the active main model when this route fails.
+        "tts_spoken_rewrite": {
+            "provider": "custom",
+            "model": "deepseek-v4-flash",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 20,
+            "extra_body": {},
+            "reasoning_effort": "",
+        },
         # Triage specifier — flesh out a rough one-liner in the Kanban
         # Triage column into a concrete spec, then promote it to ``todo``.
         # Invoked by ``hermes kanban specify`` (single id or --all). Set a
@@ -1486,6 +1500,27 @@ DEFAULT_CONFIG = {
         # Set explicitly to pin a backend:
         # "edge" (free) | "elevenlabs" (premium) | "openai" | "xai" | "minimax" | "mistral" | "gemini" | "deepinfra" | "neutts" (local) | "kittentts" (local) | "piper" (local)
         "provider": "edge",
+        "spoken_rewrite": {
+            # Opt-in during rollout.  When enabled, TTS waits for the complete
+            # reply, asks the auxiliary model for a spoken script, and refuses
+            # to speak the raw reply if the rewrite cannot be validated.
+            "enabled": False,
+            "task": "tts_spoken_rewrite",
+            "provider": "custom",
+            "model": "deepseek-v4-flash",
+            "base_url": "",
+            "api_key": "",
+            "api_mode": "",
+            "wait_for_full_turn": True,
+            "number_style": "chinese_semantic",
+            "max_chars": 800,
+            "timeout": 20,
+            "fallback_to_main": True,
+            "observability": {
+                "enabled": True,
+                "capture_script": False,
+            },
+        },
         "edge": {
             "voice": "en-US-AriaNeural",
             # Popular: AriaNeural, JennyNeural, AndrewNeural, BrianNeural, SoniaNeural

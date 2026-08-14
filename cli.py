@@ -12852,8 +12852,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # ⋗ blocks, verifier footer, units, newline flattening.
             # The TTS tool owns provider request limits and long-form chunking.
             try:
-                from tools.tts_text_normalize import prepare_spoken_text
-                tts_text = prepare_spoken_text(text, max_chars=None)
+                from tools.tts_spoken_script import spoken_rewrite_enabled
+                from tools.tts_tool import _load_tts_config
+
+                _tts_cfg = _load_tts_config()
+                _spoken_cfg = (
+                    _tts_cfg.get("spoken_rewrite")
+                    if isinstance(_tts_cfg, dict)
+                    else None
+                )
+                if spoken_rewrite_enabled(_spoken_cfg):
+                    # Preserve the complete reply for the semantic rewrite.
+                    tts_text = str(text or "").strip()
+                else:
+                    from tools.tts_text_normalize import prepare_spoken_text
+                    tts_text = prepare_spoken_text(text, max_chars=None)
             except Exception:
                 # Legacy fallback pipeline — keep voice replies best-effort.
                 tts_text = re.sub(r'```[\s\S]*?```', ' ', text)   # fenced code blocks
@@ -14230,11 +14243,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 try:
                     from tools.tts_tool import (
                         _import_sounddevice,
+                        _load_tts_config,
                         check_tts_requirements,
                         stream_tts_to_speaker,
                     )
-                    _import_sounddevice()
-                    use_streaming_tts = check_tts_requirements()
+                    from tools.tts_spoken_script import spoken_rewrite_enabled
+                    _tts_cfg = _load_tts_config()
+                    _spoken_cfg = _tts_cfg.get("spoken_rewrite") if isinstance(_tts_cfg, dict) else None
+                    if spoken_rewrite_enabled(_spoken_cfg):
+                        logger.info(
+                            "CLI streaming TTS disabled: semantic spoken rewrite waits for full reply"
+                        )
+                    else:
+                        _import_sounddevice()
+                        use_streaming_tts = check_tts_requirements()
                 except Exception:
                     pass
 

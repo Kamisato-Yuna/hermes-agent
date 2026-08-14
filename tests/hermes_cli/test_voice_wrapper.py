@@ -488,4 +488,40 @@ class TestSpeakTextStreamingDispatch:
         assert streamed == ["Hello streaming world"]
         assert synced == [], "sync whole-file path must be skipped when streaming"
 
+    def test_semantic_rewrite_bypasses_streaming_for_full_turn(self, monkeypatch):
+        """A semantic rewrite needs the completed reply before synthesis.
+
+        Even if the configured provider has a streaming implementation, the
+        voice wrapper must use the whole-file TTS entry point so the rewrite
+        layer can see the complete turn.
+        """
+        import hermes_cli.voice as voice
+        import tools.tts_streaming as ts
+        from tools import tts_tool
+
+        streamed = []
+        synced = []
+        monkeypatch.setattr(
+            tts_tool,
+            "_load_tts_config",
+            lambda: {"spoken_rewrite": {"enabled": True}},
+        )
+        monkeypatch.setattr(
+            ts, "resolve_streaming_provider", lambda cfg, preferred=None: object()
+        )
+        monkeypatch.setattr(
+            voice,
+            "_speak_text_streaming",
+            lambda *args, **kwargs: streamed.append(args[0]) or True,
+        )
+        monkeypatch.setattr(
+            tts_tool,
+            "text_to_speech_tool",
+            lambda **kwargs: synced.append(kwargs) or '{"success": false}',
+        )
+
+        assert voice.speak_text("完整的一轮回复") is None
+        assert streamed == []
+        assert len(synced) == 1
+
 

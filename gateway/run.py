@@ -25872,20 +25872,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 from gateway.streaming_tts_consumer import StreamingTTSConsumer
                 from tools.tts_tool import _load_tts_config
+                from tools.tts_spoken_script import spoken_rewrite_enabled
                 _tts_cfg = _load_tts_config()
-                _gateway_loop = self._gateway_loop or asyncio.get_event_loop()
-                _stts_consumer = StreamingTTSConsumer(
-                    adapter=_stts_adapter,
-                    chat_id=source.chat_id,
-                    tts_config=_tts_cfg,
-                    loop=_gateway_loop,
-                    metadata=_status_thread_metadata,
-                )
-                if _stts_consumer.active:
-                    streaming_tts_consumer_holder[0] = _stts_consumer
-                    _stts_consumer.start()
-                # else: consumer inactive (no streaming provider) — leave
-                # the holder as None so the whole-file fallback path runs.
+                _spoken_cfg = _tts_cfg.get("spoken_rewrite") if isinstance(_tts_cfg, dict) else None
+                if spoken_rewrite_enabled(_spoken_cfg):
+                    logger.info(
+                        "Streaming TTS disabled for this turn: semantic spoken rewrite waits for full reply"
+                    )
+                else:
+                    _gateway_loop = self._gateway_loop or asyncio.get_event_loop()
+                    _stts_consumer = StreamingTTSConsumer(
+                        adapter=_stts_adapter,
+                        chat_id=source.chat_id,
+                        tts_config=_tts_cfg,
+                        loop=_gateway_loop,
+                        metadata=_status_thread_metadata,
+                    )
+                    if _stts_consumer.active:
+                        streaming_tts_consumer_holder[0] = _stts_consumer
+                        _stts_consumer.start()
+                    # else: consumer inactive (no streaming provider) — leave
+                    # the holder as None so the whole-file fallback path runs.
             except Exception as _stts_err:
                 logger.debug("Could not set up streaming TTS consumer: %s", _stts_err)
 
