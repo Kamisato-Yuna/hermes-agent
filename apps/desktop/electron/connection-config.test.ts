@@ -15,6 +15,7 @@ import assert from 'node:assert/strict'
 import { test } from 'vitest'
 
 import {
+  apiRequestRegistryConnectionId,
   AT_COOKIE_VARIANTS,
   authModeFromStatus,
   buildGatewayWsUrl,
@@ -33,6 +34,7 @@ import {
   normalizeSshConfig,
   normAuthMode,
   pathWithGlobalRemoteProfile,
+  pathWithProfileScope,
   profileHasRemoteConnection,
   profileRemoteOverride,
   profileSshOverride,
@@ -41,7 +43,8 @@ import {
   resolveTestWsUrl,
   RT_COOKIE_VARIANTS,
   savedProfileSsh,
-  tokenPreview
+  tokenPreview,
+  translateSelfProfileQuery
 } from './connection-config'
 
 // --- connectionScopeKey / normAuthMode ---
@@ -279,6 +282,37 @@ test('resolveProfileBackendRoute only tags a descriptor when the backend is shar
   }
 })
 
+// --- registry-pinned REST routing (cron run history on remote gateways, #87882) ---
+
+test('apiRequestRegistryConnectionId extracts a genuinely non-local connection id', () => {
+  assert.equal(apiRequestRegistryConnectionId({ connectionId: 'gw-tailscale', path: '/api/cron/jobs' }), 'gw-tailscale')
+  assert.equal(apiRequestRegistryConnectionId({ connectionId: '  gw-1  ', path: '/x' }), 'gw-1')
+})
+
+test('apiRequestRegistryConnectionId resolves null for the legacy/local routes', () => {
+  assert.equal(apiRequestRegistryConnectionId({ path: '/api/cron/jobs' }), null)
+  assert.equal(apiRequestRegistryConnectionId({ connectionId: '', path: '/x' }), null)
+  assert.equal(apiRequestRegistryConnectionId({ connectionId: 'local', path: '/x' }), null)
+  assert.equal(apiRequestRegistryConnectionId({ connectionId: null, path: '/x' }), null)
+  assert.equal(apiRequestRegistryConnectionId(null), null)
+  assert.equal(apiRequestRegistryConnectionId(undefined), null)
+})
+
+test('pathWithProfileScope scopes shared-remote requests to the profile unconditionally', () => {
+  // A sharedRemote registry gateway serves every profile from one host; the
+  // run-history read must land on the profile that owns the job's sessions.
+  assert.equal(
+    pathWithProfileScope('/api/cron/jobs/job-1/runs?limit=20', 'research'),
+    '/api/cron/jobs/job-1/runs?limit=20&profile=research'
+  )
+})
+
+test('pathWithProfileScope keeps an explicit profile query and no-ops on empty profile', () => {
+  assert.equal(pathWithProfileScope('/api/cron/jobs?profile=all', 'research'), '/api/cron/jobs?profile=all')
+  assert.equal(pathWithProfileScope('/api/cron/jobs', ''), '/api/cron/jobs')
+  assert.equal(pathWithProfileScope('/api/cron/jobs', null), '/api/cron/jobs')
+})
+
 // --- pathWithGlobalRemoteProfile ---
 
 test('pathWithGlobalRemoteProfile appends profile in global remote mode', () => {
@@ -337,6 +371,59 @@ test('pathWithGlobalRemoteProfile skips local and per-profile remote override pa
     }),
     '/api/model/info'
   )
+})
+
+test('pathWithGlobalRemoteProfile translates a desktop SSH alias in an explicit profile query', () => {
+  assert.equal(
+    pathWithGlobalRemoteProfile('/api/cron/jobs?profile=mara', 'mara', {
+      globalRemote: false,
+      profileRemoteOverride: true,
+      backendProfile: 'default'
+    }),
+    '/api/cron/jobs?profile=default'
+  )
+})
+
+test('pathWithGlobalRemoteProfile preserves cross-profile selectors when translating an SSH alias', () => {
+  const opts = {
+    globalRemote: false,
+    profileRemoteOverride: true,
+    backendProfile: 'default'
+  }
+
+  assert.equal(pathWithGlobalRemoteProfile('/api/cron/jobs?profile=all', 'mara', opts), '/api/cron/jobs?profile=all')
+  assert.equal(
+    pathWithGlobalRemoteProfile('/api/cron/jobs?profile=worker', 'mara', opts),
+    '/api/cron/jobs?profile=worker'
+  )
+})
+
+// --- translateSelfProfileQuery (registry SSH-scoped hermes:api contract) ---
+
+test('translateSelfProfileQuery rewrites the self-profile filter into the backend namespace', () => {
+  assert.equal(
+    translateSelfProfileQuery('/api/cron/jobs?profile=mara', 'mara', 'default'),
+    '/api/cron/jobs?profile=default'
+  )
+  assert.equal(
+    translateSelfProfileQuery('/api/cron/blueprints/instantiate?profile=mara', 'mara', 'default'),
+    '/api/cron/blueprints/instantiate?profile=default'
+  )
+})
+
+test('translateSelfProfileQuery leaves cross-profile and unfiltered paths untouched', () => {
+  assert.equal(translateSelfProfileQuery('/api/cron/jobs?profile=all', 'mara', 'default'), '/api/cron/jobs?profile=all')
+  assert.equal(
+    translateSelfProfileQuery('/api/cron/jobs?profile=worker', 'mara', 'default'),
+    '/api/cron/jobs?profile=worker'
+  )
+  assert.equal(translateSelfProfileQuery('/api/cron/jobs', 'mara', 'default'), '/api/cron/jobs')
+})
+
+test('translateSelfProfileQuery no-ops when alias and backend profile agree or are missing', () => {
+  assert.equal(translateSelfProfileQuery('/api/cron/jobs?profile=mara', 'mara', 'mara'), '/api/cron/jobs?profile=mara')
+  assert.equal(translateSelfProfileQuery('/api/cron/jobs?profile=mara', 'mara', ''), '/api/cron/jobs?profile=mara')
+  assert.equal(translateSelfProfileQuery('/api/cron/jobs?profile=mara', '', 'default'), '/api/cron/jobs?profile=mara')
 })
 
 test('pathWithGlobalRemoteProfile skips empty profile/path safely', () => {

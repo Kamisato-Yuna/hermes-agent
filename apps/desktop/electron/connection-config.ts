@@ -388,6 +388,9 @@ function profileRemoteOverride(config, profile) {
 }
 
 export interface ProfileRouteOptions {
+  /** Profile name on a separately-scoped backend when it differs from the
+   * desktop's local routing label (managed SSH `remoteProfile`). */
+  backendProfile?: null | string
   globalRemote?: boolean
   primaryProfile?: null | string
   profileRemoteOverride?: boolean
@@ -442,13 +445,78 @@ function resolveProfileBackendRoute(profile, opts: ProfileRouteOptions = {}): Pr
 }
 
 /**
- * Add renderer-side `request.profile` to a REST path when the route says the
- * serving backend is not already scoped to that profile.
+ * Reconcile the renderer's desktop-facing profile label with the backend's
+ * profile namespace, then add `request.profile` when a shared backend needs it.
+ *
+ * A managed SSH override can deliberately map local `mara` to remote `default`.
+ * Endpoint-level filters (cron list / blueprint instantiate) arrive as an
+ * explicit `?profile=mara`; translate only that self-scope. Cross-profile
+ * selectors such as `all` or another concrete profile retain their meaning.
  */
 function pathWithGlobalRemoteProfile(path, profile, opts: ProfileRouteOptions = {}) {
-  const scopedProfile = connectionScopeKey(profile)
+  const translated = translateSelfProfileQuery(path, profile, opts.backendProfile)
+
+  if (translated !== path) {
+    return translated
+  }
 
   if (!resolveProfileBackendRoute(profile, opts).scopePath) {
+    return path
+  }
+
+  return pathWithProfileScope(path, profile)
+}
+
+/**
+ * Translate an explicit self-profile query from a Desktop routing alias to the
+ * backend's own profile namespace (a managed SSH `remoteProfile` can map local
+ * `mara` to remote `default`). Only a `?profile=` equal to the alias itself is
+ * rewritten; cross-profile selectors (`all`, another concrete profile) and
+ * unfiltered paths pass through untouched. Used by the v1 profile route above
+ * and by the registry SSH branch of the `hermes:api` handler — both routes
+ * reach a backend whose namespace is the remote profile, not the alias.
+ */
+function translateSelfProfileQuery(path, profile, backendProfile) {
+  const scopedProfile = connectionScopeKey(profile)
+  const backend = connectionScopeKey(backendProfile)
+
+  if (!scopedProfile || !backend || backend === scopedProfile) {
+    return path
+  }
+
+  const rawPath = String(path || '')
+
+  if (!rawPath) {
+    return path
+  }
+
+  let parsed
+
+  try {
+    parsed = new URL(rawPath, 'http://hermes.local')
+  } catch {
+    return path
+  }
+
+  if (connectionScopeKey(parsed.searchParams.get('profile')) !== scopedProfile) {
+    return path
+  }
+
+  parsed.searchParams.set('profile', backend)
+
+  return `${parsed.pathname}${parsed.search}${parsed.hash}`
+}
+
+/**
+ * Unconditionally scope a REST path to a profile via `?profile=`. Used by the
+ * global-remote route above and by registry `sharedRemote` connections (one
+ * gateway host serving every profile, scoped per request). An explicit
+ * `?profile=` already on the path wins; an empty profile is a no-op.
+ */
+function pathWithProfileScope(path, profile) {
+  const scopedProfile = connectionScopeKey(profile)
+
+  if (!scopedProfile) {
     return path
   }
 
@@ -473,6 +541,23 @@ function pathWithGlobalRemoteProfile(path, profile, opts: ProfileRouteOptions = 
   parsed.searchParams.set('profile', scopedProfile)
 
   return `${parsed.pathname}${parsed.search}${parsed.hash}`
+}
+
+/**
+ * Registry connection a REST request is explicitly pinned to, or null for the
+ * legacy profile-routed path. `''`/`'local'` mean the local pool — callers
+ * only detour through the registry for a genuinely non-local connection, so
+ * single-source users keep the byte-identical v1 route.
+ */
+function apiRequestRegistryConnectionId(request): null | string {
+  const raw = request && typeof request === 'object' ? (request as { connectionId?: unknown }).connectionId : ''
+  const id = String(raw ?? '').trim()
+
+  if (!id || id === 'local') {
+    return null
+  }
+
+  return id
 }
 
 function tokenPreview(value) {
@@ -588,6 +673,7 @@ function cookiesHavePrivyAccessToken(cookies) {
 }
 
 export {
+  apiRequestRegistryConnectionId,
   AT_COOKIE_VARIANTS,
   authModeFromStatus,
   buildGatewayWsUrl,
@@ -607,6 +693,7 @@ export {
   normalizeSshConfig,
   normAuthMode,
   pathWithGlobalRemoteProfile,
+  pathWithProfileScope,
   PRIVY_ACCESS_COOKIE_VARIANTS,
   PRIVY_SESSION_COOKIE_VARIANTS,
   profileHasRemoteConnection,
@@ -617,5 +704,6 @@ export {
   resolveTestWsUrl,
   RT_COOKIE_VARIANTS,
   savedProfileSsh,
-  tokenPreview
+  tokenPreview,
+  translateSelfProfileQuery
 }
