@@ -76,8 +76,13 @@ def _probe_teams_sdk_available() -> bool:
             return False
         return importlib.util.find_spec("microsoft_teams.apps") is not None
     except (ValueError, ModuleNotFoundError, ImportError):
-        # Test stubs may inject a module without ``__spec__``.
-        return "microsoft_teams.apps" in _sys.modules
+        # Test/runtime stubs may inject modules without ``__spec__``. Do not
+        # trust an orphaned ``microsoft_teams.apps`` left in ``sys.modules`` by
+        # an earlier import: if the current parent is only a namespace stub,
+        # the child must be attached to that exact parent object to count.
+        parent = _sys.modules.get("microsoft_teams")
+        apps = _sys.modules.get("microsoft_teams.apps")
+        return apps is not None and getattr(parent, "apps", None) is apps
 
 
 TEAMS_SDK_AVAILABLE = _probe_teams_sdk_available()
