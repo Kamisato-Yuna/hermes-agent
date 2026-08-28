@@ -13,7 +13,7 @@ name: Nix flake check
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [firefly-main]
 
 permissions:
   contents: read

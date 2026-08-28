@@ -17,7 +17,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [firefly-main]
 
 permissions:
   contents: read
@@ -147,7 +147,7 @@ jobs:
   contributor-check:
     name: Check contributors
     needs: detect
-    if: needs.detect.outputs.python == 'true'
+    if: needs.detect.outputs.python == 'true' && needs.detect.outputs.event_name == 'pull_request'
     uses: ./.github/workflows/contributor-check.yml
 
   uv-lockfile:

@@ -15,15 +15,7 @@ name: CI review comment
 # and the separate docker run, and it depends on neither.
 
 on:
-  workflow_run:
-    workflows: [CI]
-    # ``in_progress``, not ``requested``: a first-time contributor's run
-    # sits in ``action_required`` until a maintainer approves it, and
-    # ``requested`` fires at creation — the poller would wait out its
-    # whole timeout on a run that never starts. ``in_progress`` fires
-    # when the run actually starts, and it also fires on re-runs, which
-    # ``requested`` does not.
-    types: [in_progress]
+  workflow_dispatch:
 
 permissions:
   contents: read

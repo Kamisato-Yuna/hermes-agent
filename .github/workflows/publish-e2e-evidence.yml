@@ -4,9 +4,7 @@ name: Publish E2E evidence
 # checks out main, never the PR ref, and treats the downloaded artifact as
 # untrusted input before uploading validated GitHub attachments.
 on:
-  workflow_run:
-    workflows: [CI]
-    types: [completed]
+  workflow_dispatch:
 
 permissions:
   actions: read

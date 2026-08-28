@@ -14,8 +14,7 @@ name: Label rerun
 # rerun results.
 
 on:
-  pull_request:
-    types: [labeled]
+  workflow_dispatch:
 
 permissions:
   actions: write
