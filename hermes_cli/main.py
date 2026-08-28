@@ -10662,12 +10662,12 @@ def _finalize_update_output(state):
 def _resolve_update_branch(args) -> str:
     """Normalize ``args.branch`` into a non-empty branch name.
 
-    Centralizes the "default to main, accept --branch override, treat empty
-    or whitespace-only values as the default" parsing so every consumer of
-    ``--branch`` (check path, git-update path, ZIP-fallback path) agrees on
+    Centralizes the "default to firefly-main, accept --branch override, treat
+    empty or whitespace-only values as the default" parsing so every consumer
+    of ``--branch`` (check path, git-update path, ZIP-fallback path) agrees on
     the same answer.
     """
-    return (getattr(args, "branch", None) or "main").strip() or "main"
+    return (getattr(args, "branch", None) or "firefly-main").strip() or "firefly-main"
 
 
 def _size_delta_label(saved_mb: float) -> str:

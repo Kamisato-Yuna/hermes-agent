@@ -139,8 +139,8 @@ class TestFallbackChain:
 
     PRIMARY = "https://hermes-agent.nousresearch.com/docs/api/model-catalog.json"
     FALLBACK = (
-        "https://raw.githubusercontent.com/NousResearch/hermes-agent"
-        "/main/website/static/api/model-catalog.json"
+        "https://raw.githubusercontent.com/Kamisato-Yuna/hermes-agent"
+        "/firefly-main/website/static/api/model-catalog.json"
     )
 
     def test_uses_primary_when_it_succeeds(self, isolated_home):
