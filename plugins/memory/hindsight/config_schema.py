@@ -1,6 +1,9 @@
 """Hindsight's declared config surface — rendered by the generic desktop panel."""
 
 from plugins.memory.config_schema import (
+    KIND_BOOL,
+    KIND_JSON,
+    KIND_NUMBER,
     KIND_SECRET,
     KIND_SELECT,
     KIND_TEXT,
@@ -71,6 +74,41 @@ CONFIG_SCHEMA = ProviderConfigSchema(
                 ProviderFieldOption("high", "high"),
             ),
             inline=True,
+        ),
+        ProviderField(
+            key="recall_auto_route",
+            label="Automatic recall routing",
+            kind=KIND_BOOL,
+            default="false",
+            description="Opt in to configuration-driven recall routes.",
+            info="Routes are matched by chat identity or configured keywords; no product-specific routes are built in.",
+            group="Recall routing",
+        ),
+        ProviderField(
+            key="recall_auto_route_fail_open",
+            label="Allow unfiltered route fallback",
+            kind=KIND_BOOL,
+            default="false",
+            description="Allow an empty tagged route to retry without positive tags.",
+            info="This is off by default. Exclusion tags remain enforced when the final fallback runs.",
+            group="Recall routing",
+        ),
+        ProviderField(
+            key="recall_routes",
+            label="Recall routes",
+            kind=KIND_JSON,
+            default="",
+            description="Ordered JSON route definitions using chat_ids, chat_names, keywords, tags, types, exclusions, and result caps.",
+            info="Route names and tags are user-defined. Use fallback_tags for a tag-scoped widening step; unfiltered fallback still requires the separate opt-in.",
+            group="Recall routing",
+        ),
+        ProviderField(
+            key="recall_max_results",
+            label="Maximum recall results",
+            kind=KIND_NUMBER,
+            default="0",
+            description="Global result cap after route filtering; 0 means unlimited.",
+            group="Recall routing",
         ),
     ),
 )

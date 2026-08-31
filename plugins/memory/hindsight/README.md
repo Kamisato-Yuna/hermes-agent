@@ -79,6 +79,34 @@ Config file: `~/.hermes/hindsight/config.json`
 | `auto_recall` | `true` | Automatically recall memories before each turn |
 | `recall_sync` | `false` | Recall synchronously against the *current* message each turn (higher relevance, adds recall latency). Default off: recall runs in the background and is injected on the next turn. |
 | `recall_indicator` | `true` | Show a `👁️ Hindsight — recalled N memories` status line when auto-recall injects memory. Turn off for customer-facing agents. |
+| `recall_auto_route` | `false` | Explicitly opt in to ordered, configuration-driven route selection for automatic and tool recall. |
+| `recall_auto_route_fail_open` | `false` | After tagged route attempts are empty, allow one final fallback without positive tags. Exclusion tags remain enforced. |
+| `recall_routes` | — | JSON object/list of routes. Selectors are `chat_ids`, exact `chat_names`, and `keywords`; filters include `tags`, `tags_match`, `exclude_tags`, `fallback_tags`, `types`, `max_results`, `query_prefix`, and optional `retain_tags`. |
+| `recall_max_results` | `0` | Global client-side result cap (`0` = unlimited); a selected route's `max_results` overrides it. |
+
+A route configuration is inert until `recall_auto_route` is `true`. Route names, selectors, and tags are user-defined; no product-specific vocabulary is built into the provider. The config UI accepts either a JSON object mapping names to routes or an ordered JSON list, for example:
+
+```json
+{
+  "recall_auto_route": true,
+  "recall_auto_route_fail_open": false,
+  "recall_routes": {
+    "project-alpha": {
+      "chat_ids": ["chat-alpha"],
+      "keywords": ["alpha project", "alpha build"],
+      "tags": ["scope:alpha", "kind:project"],
+      "tags_match": "all_strict",
+      "fallback_tags": ["scope:alpha"],
+      "exclude_tags": ["sensitivity:private"],
+      "types": ["observation"],
+      "max_results": 8,
+      "retain_tags": ["scope:alpha"]
+    }
+  }
+}
+```
+
+Selection precedence is exact chat ID, exact case-insensitive chat name, then case-insensitive keyword matching in the query or chat name; ties use config order. Explicit non-empty `recall_tags` disables route selection and all route fallbacks, while explicit `recall_types` remains authoritative over a route's `types`. A route's first tag is used as a tag-scoped fallback when `fallback_tags` is omitted and multiple tags are configured. No untagged fallback occurs unless `recall_auto_route_fail_open` is explicitly enabled, and `exclude_tags` are preserved on that final request.
 
 > **Behavior change — `recall_types` defaults to `observation` only.**
 >

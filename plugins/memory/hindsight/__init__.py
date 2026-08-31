@@ -43,6 +43,7 @@ import time
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.secret_scope import get_secret
@@ -69,6 +70,20 @@ class _RecallResult:
     text: str
     count: int
 
+
+@dataclass(frozen=True)
+class _RecallPlan:
+    """A validated recall request plus its optional safe fallbacks."""
+
+    kwargs: Dict[str, Any]
+    route: Dict[str, Any] | None
+    auto_routed: bool
+    fail_open: bool
+    fallback_kwargs: tuple[Dict[str, Any], ...]
+    unfiltered_kwargs: Dict[str, Any] | None
+    exclude_tags: tuple[str, ...]
+    max_results: int
+
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
 # Keep in sync with tools/lazy_deps.py ("memory.hindsight") and plugin.yaml.
@@ -90,6 +105,22 @@ _HINDSIGHT_GLYPH = "👁️"
 # unique document_id fallback for older APIs.
 _MIN_VERSION_FOR_UPDATE_MODE_APPEND = "0.5.0"
 _VALID_BUDGETS = {"low", "mid", "high"}
+_VALID_RECALL_TAG_MATCHES = {"any", "all", "any_strict", "all_strict"}
+_RECALL_ROUTE_KEYS = {
+    "name",
+    "chat_ids",
+    "chat_names",
+    "keywords",
+    "tags",
+    "tags_match",
+    "exclude_tags",
+    "fallback_tags",
+    "fallback_tags_match",
+    "query_prefix",
+    "types",
+    "max_results",
+    "retain_tags",
+}
 _PROVIDER_DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
     "anthropic": "claude-haiku-4-5",
@@ -112,6 +143,23 @@ def _parse_int_setting(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         logger.warning("Invalid integer Hindsight setting %r; using default %s", value, default)
         return default
+
+
+def _parse_bool_setting(value: Any, default: bool) -> bool:
+    """Parse a boolean config value without treating ``\"false\"`` as true."""
+    if isinstance(value, bool):
+        return value
+    if value is None or value == "":
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    normalized = str(value).strip().casefold()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    logger.warning("Invalid boolean Hindsight setting %r; using default %s", value, default)
+    return default
 
 
 # Env var the embedded daemon manager reads (at import time, as a module-level
@@ -500,6 +548,188 @@ def _normalize_retain_tags(value: Any) -> List[str]:
     return normalized
 
 
+def _normalize_recall_routes(value: Any) -> Dict[str, Dict[str, Any]]:
+    """Normalize route config into an ordered name-to-definition mapping.
+
+    The config UI stores JSON as a string, while hand-written configs commonly
+    use an object mapping route names to route definitions.  Both forms are
+    accepted, as is an ordered list for callers that prefer it. Invalid entries
+    are ignored rather than widening recall or breaking provider startup.
+    """
+    if value is None or value == "":
+        return {}
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            logger.warning("Ignoring invalid Hindsight recall_routes JSON")
+            return {}
+
+    entries: list[tuple[str, Any]] = []
+    if isinstance(value, dict) and isinstance(value.get("routes"), (dict, list)):
+        # Accept a wrapper object used by some hand-written configs and by
+        # config exporters.  Re-run the normal mapping/list discriminator on
+        # the unwrapped value below.
+        value = value["routes"]
+    if isinstance(value, dict):
+        if value and all(isinstance(route, dict) for route in value.values()):
+            # A mapping key may itself be named "name", "tags", etc.; the
+            # value shape is the reliable discriminator here.
+            entries = [(str(name), route) for name, route in value.items()]
+        elif any(key in _RECALL_ROUTE_KEYS for key in value):
+            entries = [(str(value.get("name") or "route"), value)]
+        else:
+            entries = [(str(name), route) for name, route in value.items()]
+    elif isinstance(value, list):
+        for index, route in enumerate(value):
+            name = route.get("name") if isinstance(route, dict) else index
+            entries.append((str(name), route))
+
+    routes: Dict[str, Dict[str, Any]] = {}
+    for index, (name, route) in enumerate(entries):
+        if not isinstance(route, dict):
+            continue
+        normalized = dict(route)
+        route_name = str(normalized.get("name") or name or index)
+        if route_name in routes:
+            route_name = f"{route_name}-{index}"
+        normalized.setdefault("name", route_name)
+        routes[route_name] = normalized
+    return routes
+
+
+def _normalize_recall_match_values(value: Any) -> list[str]:
+    """Normalize route selector values while preserving configuration order."""
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _normalize_recall_tag_sets(value: Any) -> list[list[str]]:
+    """Normalize one or more fallback tag sets."""
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("["):
+            try:
+                value = json.loads(text)
+            except (TypeError, ValueError):
+                return []
+        else:
+            return [_normalize_retain_tags(text)]
+    if not isinstance(value, (list, tuple)):
+        return []
+    if all(isinstance(item, str) for item in value):
+        tags = _normalize_retain_tags(list(value))
+        return [tags] if tags else []
+    sets: list[list[str]] = []
+    for item in value:
+        tags = _normalize_retain_tags(item)
+        if tags:
+            sets.append(tags)
+    return sets
+
+
+def _valid_recall_tags_match(value: Any, default: str = "all_strict") -> str:
+    """Return a supported Hindsight tag match mode."""
+    candidate = str(value or default).strip()
+    return candidate if candidate in _VALID_RECALL_TAG_MATCHES else default
+
+
+def _result_tags(result: Any) -> set[str]:
+    """Read tags from SDK model or dict responses for defensive filtering."""
+    tags = getattr(result, "tags", None)
+    if tags is None and isinstance(result, dict):
+        tags = result.get("tags")
+    return set(_normalize_retain_tags(tags))
+
+
+def _filtered_response_results(response: Any, exclude_tags: Any = ()) -> list[Any]:
+    """Return response results with configured exclusions applied locally."""
+    excluded = set(_normalize_retain_tags(exclude_tags))
+    results = list(getattr(response, "results", None) or [])
+    if not excluded:
+        return results
+    return [result for result in results if not (_result_tags(result) & excluded)]
+
+
+def _response_with_results(response: Any, results: list[Any]) -> Any:
+    """Attach filtered results when possible, with a tiny safe response fallback."""
+    try:
+        response.results = results
+        return response
+    except Exception:
+        return SimpleNamespace(results=results)
+
+
+def _strip_internal_recall_kwargs(recall_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove provider-only routing metadata before calling the SDK."""
+    return {
+        key: value
+        for key, value in recall_kwargs.items()
+        if not key.startswith("_hindsight_")
+    }
+
+
+async def _arecall_with_fail_open(
+    client: Any,
+    recall_kwargs: Dict[str, Any],
+    *,
+    auto_routed: bool,
+    fail_open: bool = False,
+    fallback_kwargs: tuple[Dict[str, Any], ...] | list[Dict[str, Any]] = (),
+    unfiltered_kwargs: Dict[str, Any] | None = None,
+    exclude_tags: Any = (),
+) -> Any:
+    """Await a routed recall and only widen it under explicit policy.
+
+    Every stage is awaited on the same client.  Intermediate fallbacks remain
+    tag-scoped; the final unfiltered request is attempted only when
+    ``fail_open`` is explicitly enabled. SDK exceptions are propagated to the
+    existing provider error boundary rather than being mistaken for an empty
+    result and silently widening visibility.
+    """
+    async def _call(request: Dict[str, Any]) -> Any:
+        api_kwargs = _strip_internal_recall_kwargs(request)
+        try:
+            response = await client.arecall(**api_kwargs)
+        except (TypeError, ModuleNotFoundError):
+            # Older clients do not know tag_groups. Retry that same stage with
+            # positive tags and keep exclusions in the provider-side filter.
+            if "tag_groups" not in api_kwargs:
+                raise
+            fallback = dict(api_kwargs)
+            fallback.pop("tag_groups", None)
+            positive = _normalize_retain_tags(request.get("_hindsight_positive_tags"))
+            if positive:
+                fallback["tags"] = positive
+                fallback["tags_match"] = str(
+                    request.get("_hindsight_tags_match") or "all_strict"
+                )
+            response = await client.arecall(**fallback)
+            return _response_with_results(
+                response,
+                _filtered_response_results(response, exclude_tags),
+            )
+        return response
+
+    response = await _call(recall_kwargs)
+    if not auto_routed or _filtered_response_results(response, exclude_tags):
+        return response
+
+    for fallback in fallback_kwargs:
+        response = await _call(fallback)
+        if _filtered_response_results(response, exclude_tags):
+            return response
+
+    if fail_open and unfiltered_kwargs is not None:
+        return await _call(unfiltered_kwargs)
+    return response
+
+
 _OBSERVATION_SCOPE_KEYWORDS = {"per_tag", "combined", "all_combinations"}
 
 
@@ -839,6 +1069,12 @@ class HindsightMemoryProvider(MemoryProvider):
         self._tags: list[str] | None = None
         self._recall_tags: list[str] | None = None
         self._recall_tags_match = "any"
+        self._recall_tags_explicit = False
+        self._recall_auto_route = False
+        self._recall_domain_routing = False
+        self._recall_auto_route_fail_open = False
+        self._recall_routes: Dict[str, Dict[str, Any]] = {}
+        self._recall_max_results = 0
 
         # Retain controls
         self._auto_retain = True
@@ -876,6 +1112,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # `recall_max_tokens` budget. Users can restore the broader
         # recall via the `recall_types` config key.
         self._recall_types: list[str] = ["observation"]
+        self._recall_types_explicit = False
         self._recall_prompt_preamble = ""
         self._recall_max_input_chars = 800
 
@@ -1211,6 +1448,10 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "retain_assistant_prefix", "description": "Label used before assistant turns in retained transcripts", "default": "Assistant"},
             {"key": "recall_tags", "description": "Tags to filter when searching memories (comma-separated)", "default": ""},
             {"key": "recall_tags_match", "description": "Tag matching mode for recall", "default": "any", "choices": ["any", "all", "any_strict", "all_strict"]},
+            {"key": "recall_auto_route", "description": "Opt in to configuration-driven route selection for automatic and tool recall", "default": False},
+            {"key": "recall_auto_route_fail_open", "description": "Allow an automatic tagged route to retry without positive tags after all configured tagged fallbacks are empty; exclusions remain enforced", "default": False},
+            {"key": "recall_routes", "description": "Ordered JSON routes. Each route may select by chat_ids, chat_names, or keywords and define tags, tags_match, exclude_tags, fallback_tags, types, max_results, query_prefix, and retain_tags.", "default": ""},
+            {"key": "recall_max_results", "description": "Global maximum number of recall results after route filtering (0 = unlimited; a route may override)", "default": 0},
             {"key": "recall_types", "description": "Fact types to surface on recall — applies to both auto-recall and the hindsight_recall tool (comma-separated or list). Defaults to observation-only — observations are Hindsight's consolidated, deduplicated, evidence-grounded knowledge layer; raw world/experience facts are the supporting evidence observations already summarize. Set to e.g. 'observation,world,experience' to also include raw facts.", "default": "observation"},
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
             {"key": "recall_sync", "description": "Recall synchronously against the current message before each turn (higher relevance, adds recall latency to the turn). Default off: recall runs in the background and is injected on the next turn.", "default": False},
@@ -1702,8 +1943,29 @@ class HindsightMemoryProvider(MemoryProvider):
             self._config.get("observation_scopes")
             or os.environ.get("HINDSIGHT_RETAIN_OBSERVATION_SCOPES", "")
         )
-        self._recall_tags = self._config.get("recall_tags") or None
-        self._recall_tags_match = self._config.get("recall_tags_match", "any")
+        configured_recall_tags = self._config.get("recall_tags")
+        self._recall_tags = _normalize_retain_tags(configured_recall_tags) or None
+        self._recall_tags_explicit = bool(self._recall_tags)
+        self._recall_tags_match = _valid_recall_tags_match(
+            self._config.get("recall_tags_match"), default="any"
+        )
+        if "recall_auto_route" in self._config:
+            route_enabled = self._config.get("recall_auto_route")
+        else:
+            # Compatibility alias used by an earlier public route contract;
+            # it is still an explicit opt-in, never an implicit default.
+            route_enabled = self._config.get("recall_domain_routing")
+        self._recall_auto_route = _parse_bool_setting(route_enabled, False)
+        self._recall_domain_routing = self._recall_auto_route
+        self._recall_auto_route_fail_open = _parse_bool_setting(
+            self._config.get("recall_auto_route_fail_open"), False
+        )
+        self._recall_routes = _normalize_recall_routes(
+            self._config.get("recall_routes")
+        )
+        self._recall_max_results = max(
+            0, _parse_int_setting(self._config.get("recall_max_results"), 0)
+        )
         self._retain_source = str(
             self._config.get("retain_source") or os.environ.get("HINDSIGHT_RETAIN_SOURCE", _DEFAULT_RETAIN_SOURCE)
         ).strip()
@@ -1727,6 +1989,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # `recall_types` list in config.json to broaden (e.g. include
         # "world" / "experience") or to disable the filter entirely.
         configured_types = self._config.get("recall_types")
+        self._recall_types_explicit = configured_types is not None
         if configured_types is None:
             self._recall_types = ["observation"]
         elif isinstance(configured_types, str):
@@ -1838,6 +2101,214 @@ class HindsightMemoryProvider(MemoryProvider):
             t = threading.Thread(target=_start_daemon, daemon=True, name="hindsight-daemon-start")
             t.start()
 
+    def _route_values(self, route: Dict[str, Any], key: str) -> list[str]:
+        return _normalize_retain_tags(route.get(key))
+
+    def _route_match_values(self, route: Dict[str, Any], key: str) -> list[str]:
+        return _normalize_recall_match_values(route.get(key))
+
+    def _select_recall_route(self, query: str = "") -> Dict[str, Any] | None:
+        """Select one configured route without embedding product-specific terms."""
+        if not (self._recall_auto_route or self._recall_domain_routing) or not self._recall_routes:
+            return None
+
+        chat_id = str(self._chat_id or "").strip()
+        chat_name = str(self._chat_name or "").strip()
+        query_lower = str(query or "").casefold()
+        chat_name_lower = chat_name.casefold()
+
+        # Specific conversation identity wins over broad text signals.
+        for route in self._recall_routes.values():
+            if chat_id and chat_id in self._route_match_values(route, "chat_ids"):
+                return route
+        for route in self._recall_routes.values():
+            names = {
+                value.casefold()
+                for value in self._route_match_values(route, "chat_names")
+            }
+            if chat_name_lower and chat_name_lower in names:
+                return route
+        for route in self._recall_routes.values():
+            if any(
+                keyword.casefold() in query_lower
+                or (chat_name_lower and keyword.casefold() in chat_name_lower)
+                for keyword in self._route_match_values(route, "keywords")
+            ):
+                return route
+
+        # An explicitly configured selector-less route is a catch-all. It is
+        # still opt-in because recall_auto_route must be true.
+        for route in self._recall_routes.values():
+            if not any(route.get(key) for key in ("chat_ids", "chat_names", "keywords")):
+                return route
+        return None
+
+    @staticmethod
+    def _tag_group_leaf(tags: list[str], tags_match: str) -> Dict[str, Any]:
+        return {"tags": tags, "match": tags_match}
+
+    def _apply_route_tag_filters(
+        self,
+        recall_kwargs: Dict[str, Any],
+        *,
+        positive_tags: list[str],
+        tags_match: str,
+        exclude_tags: list[str],
+    ) -> None:
+        """Apply route filters and retain private metadata for compatibility."""
+        for key in ("tags", "tags_match", "tag_groups"):
+            recall_kwargs.pop(key, None)
+        recall_kwargs["_hindsight_positive_tags"] = list(positive_tags)
+        recall_kwargs["_hindsight_tags_match"] = tags_match
+        recall_kwargs["_hindsight_exclude_tags"] = list(exclude_tags)
+
+        if positive_tags and exclude_tags:
+            recall_kwargs["tag_groups"] = [
+                {
+                    "and": [
+                        self._tag_group_leaf(positive_tags, tags_match),
+                        {
+                            "not": self._tag_group_leaf(
+                                exclude_tags, "any_strict"
+                            )
+                        },
+                    ]
+                }
+            ]
+        elif positive_tags:
+            recall_kwargs["tags"] = positive_tags
+            recall_kwargs["tags_match"] = tags_match
+        elif exclude_tags:
+            recall_kwargs["tag_groups"] = [
+                {"not": self._tag_group_leaf(exclude_tags, "any_strict")}
+            ]
+
+    def _effective_recall_max_results(self, route: Dict[str, Any] | None) -> int:
+        value: Any = self._recall_max_results
+        if route is not None and "max_results" in route:
+            value = route.get("max_results")
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Ignoring invalid Hindsight recall max_results=%r", value
+            )
+            return self._recall_max_results
+
+    def _filter_recall_results(
+        self,
+        results: Any,
+        route: Dict[str, Any] | None,
+        *,
+        max_results: int | None = None,
+    ) -> list[Any]:
+        route = route or {}
+        excluded = set(self._route_values(route, "exclude_tags"))
+        filtered = [
+            result
+            for result in list(results or [])
+            if not (_result_tags(result) & excluded)
+        ]
+        cap = self._effective_recall_max_results(route) if max_results is None else max_results
+        return filtered[:cap] if cap else filtered
+
+    def _build_recall_plan(self, query: str) -> _RecallPlan:
+        """Build a recall request while keeping explicit filters authoritative."""
+        original_query = str(query or "")
+        route = self._select_recall_route(original_query)
+        explicit_tags = bool(self._recall_tags_explicit and self._recall_tags)
+        if explicit_tags:
+            # An explicit tag scope is a hard boundary: automatic route and
+            # fail-open fallback must not widen it.
+            route = None
+
+        routed_tags = self._route_values(route or {}, "tags")
+        route_exclude_tags = self._route_values(route or {}, "exclude_tags")
+        if explicit_tags:
+            active_tags = list(self._recall_tags or [])
+            active_tags_match = self._recall_tags_match
+        else:
+            active_tags = routed_tags
+            active_tags_match = _valid_recall_tags_match(
+                (route or {}).get("tags_match"), default="all_strict"
+            )
+
+        request_query = original_query
+        prefix = str((route or {}).get("query_prefix") or "").strip()
+        if prefix:
+            request_query = f"{prefix}\n\n{request_query}"
+        if self._recall_max_input_chars and len(request_query) > self._recall_max_input_chars:
+            request_query = request_query[:self._recall_max_input_chars]
+
+        kwargs: Dict[str, Any] = {
+            "bank_id": self._bank_id,
+            "query": request_query,
+            "budget": self._budget,
+            "max_tokens": self._recall_max_tokens,
+        }
+
+        route_types = _normalize_retain_tags((route or {}).get("types"))
+        if self._recall_types_explicit or not route_types:
+            if self._recall_types:
+                kwargs["types"] = list(self._recall_types)
+        else:
+            kwargs["types"] = route_types
+
+        self._apply_route_tag_filters(
+            kwargs,
+            positive_tags=active_tags,
+            tags_match=active_tags_match,
+            exclude_tags=route_exclude_tags if route is not None else [],
+        )
+
+        auto_routed = bool(route is not None and not explicit_tags and active_tags)
+        fallback_kwargs: list[Dict[str, Any]] = []
+        unfiltered_kwargs: Dict[str, Any] | None = None
+        if auto_routed:
+            fallback_sets = _normalize_recall_tag_sets(
+                route.get("fallback_tags")
+            )
+            if not fallback_sets and len(active_tags) > 1:
+                # The first configured tag is the generic route scope. This is
+                # still a configured boundary, unlike an untagged fallback.
+                fallback_sets = [active_tags[:1]]
+            fallback_match = _valid_recall_tags_match(
+                route.get("fallback_tags_match"), default="all_strict"
+            )
+            for fallback_tags in fallback_sets:
+                fallback = dict(kwargs)
+                self._apply_route_tag_filters(
+                    fallback,
+                    positive_tags=fallback_tags,
+                    tags_match=fallback_match,
+                    exclude_tags=route_exclude_tags,
+                )
+                fallback_kwargs.append(fallback)
+
+            unfiltered = dict(kwargs)
+            self._apply_route_tag_filters(
+                unfiltered,
+                positive_tags=[],
+                tags_match="all_strict",
+                exclude_tags=route_exclude_tags,
+            )
+            unfiltered_kwargs = unfiltered
+
+        return _RecallPlan(
+            kwargs=kwargs,
+            route=route,
+            auto_routed=auto_routed,
+            fail_open=(auto_routed and self._recall_auto_route_fail_open),
+            fallback_kwargs=tuple(fallback_kwargs),
+            unfiltered_kwargs=unfiltered_kwargs,
+            exclude_tags=tuple(route_exclude_tags),
+            max_results=self._effective_recall_max_results(route),
+        )
+
+    def _active_route_retain_tags(self, content: str = "") -> list[str]:
+        route = self._select_recall_route(content)
+        return self._route_values(route or {}, "retain_tags") if route else []
+
     def system_prompt_block(self) -> str:
         if self._memory_mode == "context":
             return (
@@ -1876,40 +2347,106 @@ class HindsightMemoryProvider(MemoryProvider):
     def _do_recall(self, query: str) -> _RecallResult:
         """Run one recall/reflect for *query*.
 
-        Returns the formatted memory text plus the number of discrete memories
-        recalled (0 for a reflect synthesis or on error), so the deterministic
-        recall indicator can report an accurate count without re-parsing the
-        text. Shared by the background prefetch worker (``queue_prefetch``) and
-        the opt-in synchronous path (``prefetch`` when ``recall_sync`` is on).
+        The public provider API is synchronous, but every Hindsight SDK call is
+        awaited on the shared loop. Routed recall stages all execute inside one
+        async coroutine so an empty strict result cannot skip awaits on the
+        fallback path.
         """
-        # Truncate query to max chars
-        if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
-            query = query[:self._recall_max_input_chars]
         try:
+            plan = self._build_recall_plan(query)
             if self._prefetch_method == "reflect":
-                logger.debug("Recall: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
-                resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
-                # Reflect synthesizes across many memories -> no discrete count.
-                return _RecallResult(resp.text or "", 0)
-            recall_kwargs: dict = {
-                "bank_id": self._bank_id, "query": query,
-                "budget": self._budget, "max_tokens": self._recall_max_tokens,
-            }
-            if self._recall_tags:
-                recall_kwargs["tags"] = self._recall_tags
-                recall_kwargs["tags_match"] = self._recall_tags_match
-            if self._recall_types:
-                recall_kwargs["types"] = self._recall_types
-            logger.debug("Recall: calling recall (bank=%s, query_len=%d, budget=%s)",
-                         self._bank_id, len(query), self._budget)
-            resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
-            num_results = len(resp.results) if resp.results else 0
-            logger.debug("Recall: returned %d results", num_results)
-            text = "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
-            return _RecallResult(text, num_results)
+                reflect_kwargs: Dict[str, Any] = {
+                    "bank_id": self._bank_id,
+                    "query": plan.kwargs["query"],
+                    "budget": self._budget,
+                }
+                if plan.route is not None or self._recall_tags:
+                    reflect_kwargs["max_tokens"] = self._recall_max_tokens
+                    if "types" in plan.kwargs:
+                        reflect_kwargs["fact_types"] = plan.kwargs["types"]
+                    for key in ("tags", "tags_match", "tag_groups"):
+                        if key in plan.kwargs:
+                            reflect_kwargs[key] = plan.kwargs[key]
+                logger.debug(
+                    "Recall: calling reflect (bank=%s, query_len=%d)",
+                    self._bank_id,
+                    len(plan.kwargs["query"]),
+                )
+                resp = self._run_hindsight_operation(
+                    lambda client: self._areflect_async(client, reflect_kwargs, plan)
+                )
+                return _RecallResult(getattr(resp, "text", "") or "", 0)
+
+            logger.debug(
+                "Recall: calling recall (bank=%s, query_len=%d, budget=%s, route=%s)",
+                self._bank_id,
+                len(plan.kwargs["query"]),
+                self._budget,
+                (plan.route or {}).get("name") if plan.route else None,
+            )
+            response = self._run_hindsight_operation(
+                lambda client: _arecall_with_fail_open(
+                    client,
+                    plan.kwargs,
+                    auto_routed=plan.auto_routed,
+                    fail_open=plan.fail_open,
+                    fallback_kwargs=plan.fallback_kwargs,
+                    unfiltered_kwargs=plan.unfiltered_kwargs,
+                    exclude_tags=plan.exclude_tags,
+                )
+            )
+            results = self._filter_recall_results(
+                getattr(response, "results", None),
+                plan.route,
+                max_results=plan.max_results,
+            )
+            logger.debug("Recall: returned %d results", len(results))
+            text = "\n".join(
+                f"- {result.text}"
+                for result in results
+                if getattr(result, "text", "")
+            )
+            return _RecallResult(text, len(results))
         except Exception as e:
             logger.debug("Hindsight recall failed: %s", e, exc_info=True)
             return _RecallResult("", 0)
+
+    async def _areflect_async(
+        self,
+        client: Any,
+        reflect_kwargs: Dict[str, Any],
+        plan: _RecallPlan,
+    ) -> Any:
+        """Await reflect and fall back to routed recall for old SDKs."""
+        try:
+            return await client.areflect(**reflect_kwargs)
+        except (TypeError, ModuleNotFoundError):
+            if "tag_groups" not in reflect_kwargs:
+                raise
+            logger.debug(
+                "Hindsight client rejected routed reflect tag_groups; "
+                "falling back to routed recall"
+            )
+            response = await _arecall_with_fail_open(
+                client,
+                plan.kwargs,
+                auto_routed=plan.auto_routed,
+                fail_open=plan.fail_open,
+                fallback_kwargs=plan.fallback_kwargs,
+                unfiltered_kwargs=plan.unfiltered_kwargs,
+                exclude_tags=plan.exclude_tags,
+            )
+            results = self._filter_recall_results(
+                getattr(response, "results", None),
+                plan.route,
+                max_results=plan.max_results,
+            )
+            text = "\n".join(
+                f"- {result.text}"
+                for result in results
+                if getattr(result, "text", "")
+            )
+            return SimpleNamespace(text=text)
 
     def _format_recall(self, result: str) -> str:
         if not result:
@@ -2068,6 +2605,9 @@ class HindsightMemoryProvider(MemoryProvider):
         if retain_async is not None:
             kwargs["retain_async"] = retain_async
         merged_tags = _normalize_retain_tags(self._retain_tags)
+        for tag in self._active_route_retain_tags(content):
+            if tag not in merged_tags:
+                merged_tags.append(tag)
         for tag in _normalize_retain_tags(tags):
             if tag not in merged_tags:
                 merged_tags.append(tag)
@@ -2233,23 +2773,38 @@ class HindsightMemoryProvider(MemoryProvider):
             if not query:
                 return tool_error("Missing required parameter: query")
             try:
-                recall_kwargs: dict = {
-                    "bank_id": self._bank_id, "query": query, "budget": self._budget,
-                    "max_tokens": self._recall_max_tokens,
-                }
-                if self._recall_tags:
-                    recall_kwargs["tags"] = self._recall_tags
-                    recall_kwargs["tags_match"] = self._recall_tags_match
-                if self._recall_types:
-                    recall_kwargs["types"] = self._recall_types
-                logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
-                             self._bank_id, len(query), self._budget)
-                resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
-                num_results = len(resp.results) if resp.results else 0
-                logger.debug("Tool hindsight_recall: %d results", num_results)
-                if not resp.results:
+                plan = self._build_recall_plan(query)
+                logger.debug(
+                    "Tool hindsight_recall: bank=%s, query_len=%d, budget=%s, route=%s",
+                    self._bank_id,
+                    len(plan.kwargs["query"]),
+                    self._budget,
+                    (plan.route or {}).get("name") if plan.route else None,
+                )
+                response = self._run_hindsight_operation(
+                    lambda client: _arecall_with_fail_open(
+                        client,
+                        plan.kwargs,
+                        auto_routed=plan.auto_routed,
+                        fail_open=plan.fail_open,
+                        fallback_kwargs=plan.fallback_kwargs,
+                        unfiltered_kwargs=plan.unfiltered_kwargs,
+                        exclude_tags=plan.exclude_tags,
+                    )
+                )
+                results = self._filter_recall_results(
+                    getattr(response, "results", None),
+                    plan.route,
+                    max_results=plan.max_results,
+                )
+                logger.debug("Tool hindsight_recall: %d results", len(results))
+                if not results:
                     return json.dumps({"result": "No relevant memories found."})
-                lines = [f"{i}. {r.text}" for i, r in enumerate(resp.results, 1)]
+                lines = [
+                    f"{i}. {result.text}"
+                    for i, result in enumerate(results, 1)
+                    if getattr(result, "text", "")
+                ]
                 return json.dumps({"result": "\n".join(lines)})
             except Exception as e:
                 logger.warning("hindsight_recall failed: %s", e, exc_info=True)
@@ -2260,15 +2815,32 @@ class HindsightMemoryProvider(MemoryProvider):
             if not query:
                 return tool_error("Missing required parameter: query")
             try:
-                logger.debug("Tool hindsight_reflect: bank=%s, query_len=%d, budget=%s",
-                             self._bank_id, len(query), self._budget)
-                resp = self._run_hindsight_operation(
-                    lambda client: client.areflect(
-                        bank_id=self._bank_id, query=query, budget=self._budget
-                    )
+                plan = self._build_recall_plan(query)
+                reflect_kwargs: Dict[str, Any] = {
+                    "bank_id": self._bank_id,
+                    "query": plan.kwargs["query"],
+                    "budget": self._budget,
+                }
+                if plan.route is not None or self._recall_tags:
+                    reflect_kwargs["max_tokens"] = self._recall_max_tokens
+                    if "types" in plan.kwargs:
+                        reflect_kwargs["fact_types"] = plan.kwargs["types"]
+                    for key in ("tags", "tags_match", "tag_groups"):
+                        if key in plan.kwargs:
+                            reflect_kwargs[key] = plan.kwargs[key]
+                logger.debug(
+                    "Tool hindsight_reflect: bank=%s, query_len=%d, budget=%s, route=%s",
+                    self._bank_id,
+                    len(plan.kwargs["query"]),
+                    self._budget,
+                    (plan.route or {}).get("name") if plan.route else None,
                 )
-                logger.debug("Tool hindsight_reflect: response_len=%d", len(resp.text or ""))
-                return json.dumps({"result": resp.text or "No relevant memories found."})
+                response = self._run_hindsight_operation(
+                    lambda client: self._areflect_async(client, reflect_kwargs, plan)
+                )
+                text = getattr(response, "text", "") or ""
+                logger.debug("Tool hindsight_reflect: response_len=%d", len(text))
+                return json.dumps({"result": text or "No relevant memories found."})
             except Exception as e:
                 logger.warning("hindsight_reflect failed: %s", e, exc_info=True)
                 return tool_error(f"Failed to reflect: {e}")
