@@ -20,7 +20,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from tools.tts_text_normalize import prepare_spoken_text
 from utils import is_truthy_value
@@ -33,6 +33,11 @@ _DEFAULT_AUX_PROVIDER = "custom"
 _DEFAULT_AUX_MODEL = "deepseek-v4-flash"
 _DEFAULT_MAX_CHARS = 800
 _DEFAULT_TIMEOUT = 20.0
+
+# English proper nouns kept verbatim (read in English) by the spoken-rewrite
+# safety layer, unless overridden via tts.spoken_rewrite.preserve_terms. Latin
+# letters in the final script otherwise trip the latin_text safety gate.
+_DEFAULT_PRESERVE_TERMS = ("Hermes", "MiniMax", "CLI", "API", "GitHub", "macOS")
 
 # Chinese punctuation is intentionally finite.  A model response containing
 # Latin identifiers, raw protocol punctuation, or a control tag must not reach
@@ -247,8 +252,44 @@ def normalize_chinese_semantics(text: str) -> str:
     return normalized
 
 
-def validate_spoken_text(text: str, max_chars: int = _DEFAULT_MAX_CHARS) -> List[str]:
-    """Return safety-gate errors; an empty list means the script is safe."""
+def _mask_preserved_terms(text: str, terms: Sequence[str]) -> str:
+    """Replace whitelisted English proper nouns with a CJK placeholder so the
+    latin_text / unsupported_character gates only judge *unlisted* Latin text."""
+    if not terms:
+        return str(text)
+    masked = str(text)
+    for term in terms:
+        t = str(term).strip()
+        if t:
+            masked = re.sub(re.escape(t), "口", masked)
+    return masked
+
+
+def _resolve_preserve_terms(settings: Mapping[str, Any]) -> tuple:
+    """Resolve the preserved-English-terms list from config (overridable via
+    tts.spoken_rewrite.preserve_terms)."""
+    terms = settings.get("preserve_terms")
+    if terms is None:
+        return _DEFAULT_PRESERVE_TERMS
+    if isinstance(terms, str):
+        split = [t.strip() for t in re.split(r"[，,、\s]+", terms) if t.strip()]
+        return tuple(split)
+    if isinstance(terms, (list, tuple)):
+        return tuple(str(t).strip() for t in terms if str(t).strip())
+    return _DEFAULT_PRESERVE_TERMS
+
+
+def validate_spoken_text(
+    text: str,
+    max_chars: int = _DEFAULT_MAX_CHARS,
+    allowed_latin_terms: Sequence[str] = (),
+) -> List[str]:
+    """Return safety-gate errors; an empty list means the script is safe.
+
+    allowed_latin_terms: English proper nouns permitted to survive verbatim
+    (read in English). Their letters are masked before the latin_text and
+    unsupported_character checks; any other Latin still trips the gate.
+    """
     errors: List[str] = []
     value = str(text or "").strip()
     if not value:
@@ -263,15 +304,16 @@ def validate_spoken_text(text: str, max_chars: int = _DEFAULT_MAX_CHARS) -> List
         errors.append("raw_date")
     if _RAW_NUMBER_RE.search(value):
         errors.append("raw_number")
-    if re.search(r"[A-Za-z]", value):
+    masked = _mask_preserved_terms(value, allowed_latin_terms)
+    if re.search(r"[A-Za-z]", masked):
         errors.append("latin_text")
-    if _UNSAFE_SYMBOL_RE.search(value):
+    if _UNSAFE_SYMBOL_RE.search(masked):
         errors.append("unsafe_symbol")
 
     unsupported = sorted(
         {
             char
-            for char in value
+            for char in masked
             if not char.isspace() and not _is_cjk(char) and char not in _SAFE_PUNCTUATION
         }
     )
@@ -361,11 +403,21 @@ def _parse_rewrite_response(response: Any) -> str:
     return spoken.strip()
 
 
-def _rewrite_messages(reply: str, max_chars: int) -> List[Dict[str, str]]:
+def _rewrite_messages(
+    reply: str, max_chars: int, preserve_terms: Sequence[str] = ()
+) -> List[Dict[str, str]]:
     system = (
         "你负责生成安全的中文语音播报稿。先理解完整的助手回复，再只保留结论、重要限制和下一步。"
         "只返回一个严格 JSON 对象，格式必须是 {\"spoken_text\":\"...\"}，不要 Markdown、解释、代码块或其他字段。"
         "播报稿只能是自然、简短的中文口语和中文标点。删除 URL、文件路径、代码、表格、内部编号、英文术语和无意义技术细节。"
+    )
+    if preserve_terms:
+        keep = "、".join(str(t) for t in preserve_terms if str(t).strip())
+        system += (
+            f" 以下英文专有名词必须保留英文原文、不要翻译或音译成中文：{keep}。"
+            " 除此之外，任何其他英文都不允许出现在播报稿里。"
+        )
+    system += (
         "数字、日期、百分比和时长要按中文语义改写：8/07 说成八月七日，2026-08-07 说成二零二六年八月七日，35%说成百分之三十五，8h说成八小时。"
         "不要把改写过程、语气指导、停顿标签或控制指令放进 spoken_text。"
         f"播报稿最多 {max_chars} 个字符。"
@@ -503,7 +555,8 @@ def prepare_spoken_script(
             primary_route["api_mode"] = _route_value(main, "api_mode")
     max_chars = int(settings.get("max_chars") or _DEFAULT_MAX_CHARS)
     timeout = float(settings.get("timeout") or _DEFAULT_TIMEOUT)
-    messages = _rewrite_messages(reply, max_chars)
+    preserve_terms = _resolve_preserve_terms(settings)
+    messages = _rewrite_messages(reply, max_chars, preserve_terms)
 
     if call_llm_fn is None:
         from agent.auxiliary_client import call_llm as call_llm_fn
@@ -566,7 +619,9 @@ def prepare_spoken_script(
             # The shared cleaner may add ASCII sentence stops when it flattens
             # model line breaks. Normalize once more before the allow-list gate.
             cleaned = normalize_chinese_semantics(cleaned)
-            errors = validate_spoken_text(cleaned, max_chars=max_chars)
+            errors = validate_spoken_text(
+                cleaned, max_chars=max_chars, allowed_latin_terms=preserve_terms
+            )
             if errors:
                 last_errors = errors
                 _record_event(
