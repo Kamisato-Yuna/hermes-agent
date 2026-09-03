@@ -273,7 +273,7 @@ def test_ci_jobs_only_gate_on_detect_outputs_that_detect_actually_declares():
     the composite action re-exported it, but ci.yaml's ``detect`` job did not,
     so ``needs.detect.outputs.rust`` was never anything but "".
     """
-    ci = _yaml(".github/workflows/ci.yaml")
+    ci = _yaml(".github/workflows/ci-orchestrator.yaml")
     declared = set(ci["jobs"]["detect"]["outputs"])
 
     referenced: set[str] = set()
