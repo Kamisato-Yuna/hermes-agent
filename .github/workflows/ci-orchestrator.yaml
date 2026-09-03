@@ -123,7 +123,9 @@ jobs:
     # single job in the workflow — while still running the full pytest lanes.
     #
     # Re-disabled (Sep 2026): the Sep 1 re-enable is still incredibly flaky.
-    if: ${{ false && (needs.detect.outputs.python_prod == 'true' || needs.detect.outputs.frontend == 'true' })}
+    # (Also fixes the unclosed ${{ }} expression that made GitHub reject the
+    # whole workflow file on push events — 0-job startup_failure every time.)
+    if: false # ${{ needs.detect.outputs.python_prod == 'true' || needs.detect.outputs.frontend == 'true' }}
     uses: ./.github/workflows/e2e-desktop.yml
 
   docs-site:
