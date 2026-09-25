@@ -41,6 +41,7 @@ data/
 .pytest_cache/
 test_durations.json
 .pytest-cache/
+.ruff_cache/
 tmp/
 temp_vision_images/
 hermes-*/*
@@ -156,6 +157,23 @@ models-dev-upstream/
 .mcp.json
 opencode.json
 config/mcporter.json
+
+# Local cross-agent Feishu/Lark skill installs and their generated links.
+# The canonical skill sources live outside this Hermes checkout.
+/.agents/skills/lark-*
+/.claude/skills/lark-*
+/.lingma/skills/lark-*
+/.qoder/skills/lark-*
+/.qwen/skills/lark-*
+/.trae/skills/lark-*
+/skills/lark-*
+/skills-lock.json
+
+# Local CodeGraph index; the database is machine-specific and large.
+/.codegraph/
+
+# Personal backup of a pre-merge CLI command registry.
+/hermes_cli/commands.py.bak-zhmenu
 
 hermes_cli/tui_dist/*
 hermes_cli/scripts/
