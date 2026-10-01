@@ -2,12 +2,14 @@
 
 from unittest.mock import patch
 
-from tools import tts_tool
+from tools import tts_tool, tts_tool_speaker
 
 
 def test_stream_tts_returns_without_speaking_when_semantic_rewrite_enabled():
     import queue
     import threading
+
+    from tools.tts_tool_speaker import stream_tts_to_speaker
 
     done = threading.Event()
     q = queue.Queue()
@@ -18,7 +20,7 @@ def test_stream_tts_returns_without_speaking_when_semantic_rewrite_enabled():
         "_load_tts_config",
         return_value={"spoken_rewrite": {"enabled": True}},
     ), patch("tools.tts_streaming.resolve_streaming_provider") as resolve:
-        tts_tool.stream_tts_to_speaker(q, threading.Event(), done)
+        stream_tts_to_speaker(q, threading.Event(), done)
 
     resolve.assert_not_called()
     assert done.is_set()
@@ -27,6 +29,8 @@ def test_stream_tts_returns_without_speaking_when_semantic_rewrite_enabled():
 def test_stream_tts_keeps_legacy_path_when_semantic_rewrite_disabled():
     import queue
     import threading
+
+    from tools.tts_tool_speaker import stream_tts_to_speaker
 
     done = threading.Event()
     q = queue.Queue()
@@ -37,9 +41,9 @@ def test_stream_tts_keeps_legacy_path_when_semantic_rewrite_disabled():
         "_load_tts_config",
         return_value={"spoken_rewrite": {"enabled": False}},
     ), patch("tools.tts_streaming.resolve_streaming_provider", return_value=None), patch.object(
-        tts_tool, "_SyncSentencePipeline"
+        tts_tool_speaker, "_SyncSentencePipeline"
     ) as pipeline:
-        tts_tool.stream_tts_to_speaker(q, threading.Event(), done)
+        stream_tts_to_speaker(q, threading.Event(), done)
 
     pipeline.assert_called_once()
     assert done.is_set()
