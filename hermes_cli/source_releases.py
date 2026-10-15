@@ -15,6 +15,10 @@ from hermes_cli.update_channel import STABLE_TAG_RE, is_canary_tag
 logger = logging.getLogger(__name__)
 _PUBLIC_BASE = "https://hermes-assets.nousresearch.com"
 OFFICIAL_REPOSITORY = "NousResearch/hermes-agent"
+# This fork's user-facing update source; keep distinct from the upstream repository
+# used by upstream-only metadata and legacy compatibility checks.
+DEFAULT_UPDATE_REPOSITORY = "Kamisato-Yuna/hermes-agent"
+DEFAULT_UPDATE_BRANCH = "firefly-main"
 _GITHUB_ORIGIN = re.compile(
     r"^(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)"
     r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$", re.IGNORECASE,
@@ -130,10 +134,10 @@ def _resolve_source_target(channel: str, git_cmd=None, cwd=None, *, repository=N
     if channel == "stable":
         return _resolve_stable(repository, git_cmd, cwd)
     if channel == "main":
-        # main IS the git branch. No R2 record is read: none was ever published, and a
-        # network that answers it with 403 instead of 404 (regional WAFs) must not stop
-        # an install from following the branch it is on.
-        return SourceTarget(channel, channel, repository, branch="main")
+        # This fork's main channel follows firefly-main; upstream-compatible installs
+        # retain their main branch. No R2 record is read for either source branch.
+        branch = DEFAULT_UPDATE_BRANCH if repository.lower() == DEFAULT_UPDATE_REPOSITORY.lower() else "main"
+        return SourceTarget(channel, channel, repository, branch=branch)
     resolved = _resolve_channel(channel, repository)
     terminal = resolved.terminal
     if terminal["repository"].lower() != repository.lower():

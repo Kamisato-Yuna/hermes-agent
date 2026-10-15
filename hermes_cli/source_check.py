@@ -9,7 +9,7 @@ import logging
 import os
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
@@ -17,7 +17,13 @@ import urllib.error
 import urllib.request
 
 from hermes_constants import get_hermes_home
-from hermes_cli.source_releases import OFFICIAL_REPOSITORY, _GITHUB_ORIGIN, resolve_source_target
+from hermes_cli.source_releases import (
+    DEFAULT_UPDATE_BRANCH,
+    DEFAULT_UPDATE_REPOSITORY,
+    OFFICIAL_REPOSITORY,
+    _GITHUB_ORIGIN,
+    resolve_source_target,
+)
 
 logger = logging.getLogger(__name__)
 UPDATE_AVAILABLE_NO_COUNT = -1
@@ -161,7 +167,7 @@ def _branch_tip(repository: str | None, branch: str, root: Path, git: str,
             return sha, False, None
         if failure is None:
             failure = "api.github.com returned no commit for the branch."
-        if branch == "main" and remote == "origin":
+        if branch in {"main", DEFAULT_UPDATE_BRANCH} and remote == "origin":
             return None, False, failure
     result = _git_run(["ls-remote", "--exit-code", "--heads", remote, f"refs/heads/{branch}"],
                       cwd=root, git=git, timeout=10)
@@ -248,6 +254,13 @@ def _checked_out_branch(current_branch: Optional[str], fallback: Optional[str]) 
     return current_branch if current_branch and current_branch != "HEAD" else fallback
 
 
+def _default_branch(co: _Checkout) -> str:
+    """User-facing default for this source: fork installs follow firefly-main."""
+    if co.repository and co.repository.casefold() == DEFAULT_UPDATE_REPOSITORY.casefold():
+        return DEFAULT_UPDATE_BRANCH
+    return "main"
+
+
 def _cached_status(cache_file: Path, identity: dict, now: float) -> Optional[dict]:
     """A still-fresh supported status cached for exactly this identity, else None.
 
@@ -305,26 +318,28 @@ def _resolve_channel(result: dict, channel: str, co: _Checkout, *, forward_only:
 def _branch_remote(co: _Checkout, selected_branch: str) -> str:
     official_ssh = (co.repository and co.repository.lower() == OFFICIAL_REPOSITORY.lower()
                     and co.origin.lower().startswith(("git@", "ssh://")))
-    # The public official repo does not require the user's SSH credentials.
-    # Forks must keep their own origin, including its authentication.
+    # Embedded builds have no Git remote to consult; the fork's main channel reads
+    # its target over public HTTPS. Git checkouts otherwise preserve their origin/auth.
+    if co.embedded:
+        return f"https://github.com/{co.repository or DEFAULT_UPDATE_REPOSITORY}.git"
     return (f"https://github.com/{OFFICIAL_REPOSITORY}.git"
-            if co.embedded or (official_ssh and selected_branch != "main") else "origin")
+            if official_ssh and selected_branch != "main" else "origin")
 
 
-def _heal_deleted_branch(branch_config_path: Path, desktop_config: dict) -> None:
-    """Point the Desktop branch setting back at main after its branch was deleted upstream."""
+def _heal_deleted_branch(branch_config_path: Path, desktop_config: dict, default_branch: str) -> None:
+    """Point the Desktop branch setting back at this source's default after deletion."""
     # Do not overwrite a concurrent choice made while the network probe ran.
     if _read_json(branch_config_path) == desktop_config:
         from utils import atomic_json_write
-        atomic_json_write(branch_config_path, {**desktop_config, "branch": "main"})
+        atomic_json_write(branch_config_path, {**desktop_config, "branch": default_branch})
 
 
-def _unhealable_reason(co: _Checkout, branch: str) -> Optional[str]:
-    """Why a branch the remote does not advertise must keep its pin; None when healing loses nothing.
+def _unhealable_reason(co: _Checkout, branch: str, default_branch: str) -> Optional[str]:
+    """Why a branch the remote does not advertise must keep its pin; None when safely merged.
 
     An empty ref advertisement cannot tell "merged and deleted upstream" from "never pushed":
     only a branch that was once published (remote-tracking ref or configured upstream, which
-    survives ``fetch --prune``) and whose commits are all in main may be re-pinned to main.
+    survives ``fetch --prune``) and whose commits are all in the default branch may be re-pinned.
     """
     if co.embedded:
         return None
@@ -334,7 +349,7 @@ def _unhealable_reason(co: _Checkout, branch: str) -> Optional[str]:
     if not (_git_ok(["rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"], cwd=co.root, git=co.git)
             or _git_ok(["config", "--get", f"branch.{branch}.merge"], cwd=co.root, git=co.git)):
         return "never-pushed"
-    for base in ("refs/remotes/origin/main", "refs/heads/main"):
+    for base in (f"refs/remotes/origin/{default_branch}", f"refs/heads/{default_branch}"):
         # `git cherry` also treats rebase-merged commits (same patch, new SHA) as merged.
         cherry = _git_run(["cherry", base, local], cwd=co.root, git=co.git, timeout=10)
         if cherry is not None and cherry.returncode == 0:
@@ -357,22 +372,24 @@ def _behind_count(co: _Checkout, target: str) -> tuple[int, list[dict]]:
 
 def _check_branch(result: dict, co: _Checkout, selected_branch: str, *,
                   heal: Optional[tuple[Path, dict]]) -> None:
-    """Compare the checkout with ``selected_branch``'s remote tip, falling back to main if it was deleted."""
+    """Compare with ``selected_branch``; a deleted custom branch heals to this source's default."""
+    default_branch = _default_branch(co)
     result["branch"] = selected_branch
     remote = _branch_remote(co, selected_branch)
     target, missing, failure = _branch_tip(co.repository, selected_branch, co.root, co.git, remote)
-    reason = _unhealable_reason(co, selected_branch) if missing and selected_branch != "main" else None
+    reason = _unhealable_reason(co, selected_branch, default_branch) if missing and selected_branch != default_branch else None
     if reason:
         detail = ("has never been pushed" if reason == "never-pushed"
-                  else "is gone from the remote but has commits that are not in main")
+                  else f"is gone from the remote but has commits that are not in {default_branch}")
         result.update(error="branch-local-only", localOnly=True,
-                      message=f"Branch '{selected_branch}' {detail}; keeping it instead of switching to main.")
+                      message=f"Branch '{selected_branch}' {detail}; keeping it instead of switching to {default_branch}.")
         return
-    if missing and selected_branch != "main":
-        result["branch"] = "main"
+    if missing and selected_branch != default_branch:
+        result["branch"] = default_branch
         if heal:
-            _heal_deleted_branch(*heal)
-        target, _, failure = _branch_tip(co.repository, "main", co.root, co.git, remote if co.embedded else "origin")
+            _heal_deleted_branch(*heal, default_branch)
+        target, _, failure = _branch_tip(co.repository, default_branch, co.root, co.git,
+                                        remote if co.embedded else "origin")
     if target is None:
         result.update(error="fetch-failed",
                       message=f"Could not resolve the remote branch tip: {failure}" if failure
@@ -412,9 +429,16 @@ def check_for_updates(*, install_root: Path | None = None, home: Path | None = N
     channel = resolve_update_channel(config, root) if channel is None else validate_name(channel)
     forward_only = rides_default_channel(channel_record(config, root), channel, root)
     co = _read_checkout(root, git, embedded)
+    if embedded and channel == "main":
+        # Embedded builds carry no origin URL to identify this fork. For its
+        # main channel, the update hint must still follow the fork's firefly-main.
+        co = replace(co, repository=DEFAULT_UPDATE_REPOSITORY)
     desktop_config = _read_json(branch_config_path) if branch_config_path else None
     configured_branch = _configured_branch(desktop_config)
-    selected_branch = branch or configured_branch or _checked_out_branch(co.current_branch, "main")
+    source_default_branch = _default_branch(co)
+    default_branch = (source_default_branch if channel == "main"
+                      else _checked_out_branch(co.current_branch, source_default_branch))
+    selected_branch = branch or configured_branch or default_branch
     result.update(supported=True, currentSha=co.head, currentBranch=co.current_branch, dirty=co.dirty)
     if channel != "main":
         result["channel"] = channel
@@ -435,8 +459,12 @@ def check_for_updates(*, install_root: Path | None = None, home: Path | None = N
     elif branch is None:
         source_target = _resolve_channel(result, channel, co, forward_only=forward_only)
         if source_target is not None and not source_target.commit:
-            # The record supplies a default, not permission to leave the user's branch.
-            selected_branch = configured_branch or _checked_out_branch(co.current_branch, source_target.branch)
+            if channel == "main" and _default_branch(co) == DEFAULT_UPDATE_BRANCH:
+                # The fork's main channel follows firefly-main regardless of a local main checkout.
+                selected_branch = configured_branch or source_target.branch or DEFAULT_UPDATE_BRANCH
+            else:
+                # Upstream and named release channels preserve current/configured branch precedence.
+                selected_branch = configured_branch or _checked_out_branch(co.current_branch, source_target.branch)
     if "error" not in result and (source_target is None or source_target.branch is not None):
         # Only a Desktop-configured branch the caller did not override is healed.
         heal = branch_config_path and not branch and configured_branch == selected_branch

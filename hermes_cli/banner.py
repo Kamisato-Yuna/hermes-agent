@@ -206,7 +206,7 @@ def _git_run(args: list[str], *, cwd: Optional[Path] = None, timeout: int = 5, t
     try:
         return subprocess.run(
             ["git", *args], capture_output=True, timeout=timeout, cwd=str(cwd) if cwd is not None else None,
-            **(_GIT_TEXT_KW if text else {}), **kwargs)
+            check=False, **(_GIT_TEXT_KW if text else {}), **kwargs)
     except Exception:
         return None
 
@@ -236,7 +236,7 @@ def _is_full_sha(value: Optional[str]) -> bool:
     return isinstance(value, str) and len(value) == 40 and all(c in "0123456789abcdefABCDEF" for c in value)
 
 
-_compare_payload_cache: Dict[tuple, dict] = {}
+_compare_payload_cache: dict[tuple, dict] = {}
 
 
 def _github_compare(current_rev: str, target_rev: str) -> Optional[dict]:
@@ -251,7 +251,10 @@ def _github_compare(current_rev: str, target_rev: str) -> Optional[dict]:
     key = (current_rev, target_rev)
     if key in _compare_payload_cache:
         return _compare_payload_cache[key]
-    url = f"https://api.github.com/repos/nousresearch/hermes-agent/compare/{current_rev}...{target_rev}"
+    url = (
+        f"https://api.github.com/repos/{source_check.DEFAULT_UPDATE_REPOSITORY}"
+        f"/compare/{current_rev}...{target_rev}"
+    )
 
     def _fetch():
         import urllib.request
@@ -274,8 +277,8 @@ def _github_compare_behind(current_rev: str, target_rev: str) -> Optional[int]:
     return ahead if isinstance(ahead, int) and not isinstance(ahead, bool) and ahead >= 0 else None
 
 
-def upstream_commits_behind(n: int = 20) -> List[Dict[str, Any]]:
-    """Commits between the last checked HEAD and upstream tip, newest first; [] when unknown.
+def upstream_commits_behind(n: int = 20) -> list[dict[str, Any]]:
+    """Commits between the last checked HEAD and firefly-main tip, newest first; [] when unknown.
 
     Reads the tips recorded by ``check_for_updates`` so it costs no extra request when the
     compare payload is already memoized for this process.
@@ -285,13 +288,13 @@ def upstream_commits_behind(n: int = 20) -> List[Dict[str, Any]]:
     if not head_rev or not target_rev or head_rev == target_rev:
         return []
     payload = _github_compare(head_rev, target_rev)
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
     for entry in (payload or {}).get("commits", []) if isinstance(payload, dict) else []:
         commit = entry.get("commit") or {}
         when = ((commit.get("committer") or {}).get("date") or "")
         try:
             from datetime import datetime
-            at = int(datetime.fromisoformat(when.replace("Z", "+00:00")).timestamp()) if when else 0
+            at = int(datetime.fromisoformat(when).timestamp()) if when else 0
         except ValueError:
             at = 0
         rows.append({
@@ -338,25 +341,29 @@ def _github_branch_tip(repo_slug: str, branch: str) -> Optional[str]:
 
 
 def _upstream_main_sha() -> Optional[str]:
-    """Tip SHA of upstream main; API first, HTTPS ``ls-remote`` (no auth, no prompts) as fallback."""
-    sha = _github_branch_tip(_OFFICIAL_REPO_CANONICAL.removeprefix("github.com/"), "main")
+    """Tip SHA of the fork's firefly-main update branch; API first, HTTPS ls-remote fallback."""
+    sha = _github_branch_tip(
+        source_check.DEFAULT_UPDATE_REPOSITORY, source_check.DEFAULT_UPDATE_BRANCH)
     if sha:
         return sha
-    result = _git_run(["ls-remote", _UPSTREAM_REPO_URL, "refs/heads/main"], timeout=10, network=True)
+    result = _git_run(
+        ["ls-remote", _UPSTREAM_REPO_URL,
+         f"refs/heads/{source_check.DEFAULT_UPDATE_BRANCH}"],
+        timeout=10, network=True)
     if result is None or result.returncode != 0 or not result.stdout:
         return None
     return result.stdout.split()[0] or None
 
 
 def _check_via_rev(local_rev: str) -> Optional[int]:
-    """Compare an embedded git revision to upstream main via the API (see ``_tips_behind``)."""
+    """Compare an embedded git revision to the firefly-main update tip via GitHub API."""
     global _last_target_rev
     _last_target_rev = _upstream_main_sha()
     return _tips_behind(local_rev, _last_target_rev)
 
 
 def _check_via_local_git(repo_dir: Path) -> Optional[int]:
-    """Count commits behind origin/main in a local checkout.
+    """Count commits behind origin/firefly-main in a local checkout.
 
     Passive checks never run ``git fetch``: every CLI/TUI/gateway start used to negotiate a pack
     with GitHub, and across the install base that was tens of millions of fetch requests a day
@@ -365,23 +372,24 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     the compare API when they differ. ``git fetch`` happens only inside ``hermes update``.
     """
     # Probe the origin URL under the config-isolated env: a global url.<https>.insteadOf rewrite
-    # otherwise makes an SSH origin masquerade as HTTPS (#104591).
+    # otherwise makes an SSH origin masquerade as HTTPS.
     origin_url = _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir, network=True)
     head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
     if not head_rev:
         return None
     canonical = _canonical_github_remote(origin_url)
+    branch = source_check.DEFAULT_UPDATE_BRANCH
     if canonical.startswith("github.com/"):
-        target_rev = _github_branch_tip(canonical.removeprefix("github.com/"), "main")
+        target_rev = _github_branch_tip(canonical.removeprefix("github.com/"), branch)
     else:
-        # Non-GitHub origin: one ls-remote for the tip (ref advertisement only, no pack transfer).
-        result = _git_run(["ls-remote", "origin", "refs/heads/main"], cwd=repo_dir, timeout=10, network=True)
+        # Non-GitHub origin: one ls-remote for the firefly-main tip (ref advertisement only, no pack transfer).
+        result = _git_run(["ls-remote", "origin", f"refs/heads/{branch}"], cwd=repo_dir, timeout=10, network=True)
         target_rev = result.stdout.split()[0] if result is not None and result.returncode == 0 and result.stdout else None
     global _last_target_rev
     _last_target_rev = target_rev
-    # Tip SHAs alone can't distinguish "behind" from a local commit AHEAD of origin/main, and
+    # Tip SHAs alone can't distinguish "behind" from a local commit AHEAD of origin/firefly-main, and
     # misreporting an ahead checkout nudges the user into `hermes update`, which can wipe carried
-    # work — hence the ancestor check inside _tips_behind, against the FRESH upstream SHA.
+    # work — hence the ancestor check inside _tips_behind, against the FRESH firefly-main SHA.
     return _tips_behind(head_rev, target_rev, repo_dir)
 
 
@@ -394,8 +402,9 @@ def _read_json(path: Path) -> Optional[dict]:
 def check_for_updates(*, passive: bool = False) -> Optional[int]:
     """Check whether a Hermes update is available.
 
-    If ``HERMES_REVISION`` is set (nix builds embed it), compare it to upstream main; otherwise
-    compare the local checkout's HEAD. Both go through the GitHub API, never ``git fetch``.
+    If ``HERMES_REVISION`` is set, compare it to the fork's firefly-main tip; otherwise
+    compare the local checkout's HEAD with the same update target. Both paths use the GitHub API,
+    never ``git fetch``.
     """
     def _read_config_opt_out():
         from hermes_cli.config import load_config
@@ -423,7 +432,8 @@ def check_for_updates(*, passive: bool = False) -> Optional[int]:
     head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir) if repo_dir is not None else None
     cached = _read_json(cache_file)
     if cached is not None and cached.get("rev") == embedded_rev and cached.get("ver") == VERSION \
-            and cached.get("head") == head_rev:
+            and cached.get("head") == head_rev \
+            and cached.get("target_branch") == source_check.DEFAULT_UPDATE_BRANCH:
         ttl = _UPDATE_CHECK_CACHE_SECONDS if cached.get("behind") is not None else _UPDATE_CHECK_FAILURE_CACHE_SECONDS
         if now - cached.get("ts", 0) < ttl:
             return cached.get("behind")
@@ -434,7 +444,8 @@ def check_for_updates(*, passive: bool = False) -> Optional[int]:
         behind = _check_via_local_git(repo_dir) if repo_dir is not None else None
     _quiet(lambda: cache_file.write_text(
         json.dumps({"ts": now, "behind": behind, "rev": embedded_rev, "ver": VERSION,
-                    "head": head_rev or embedded_rev, "target": _last_target_rev}),
+                    "head": head_rev or embedded_rev, "target": _last_target_rev,
+                    "target_branch": source_check.DEFAULT_UPDATE_BRANCH}),
         encoding="utf-8"))
     return behind
 
@@ -475,11 +486,13 @@ def _compute_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]
     repo_dir = repo_dir or _resolve_repo_dir()
     if repo_dir is None:
         return _baked_banner_state()
-    upstream, local = (source_check._git_stdout(["rev-parse", "--short=8", rev], cwd=repo_dir) for rev in ("origin/main", "HEAD"))
+    upstream, local = (source_check._git_stdout(["rev-parse", "--short=8", rev], cwd=repo_dir)
+                       for rev in (f"origin/{source_check.DEFAULT_UPDATE_BRANCH}", "HEAD"))
     if not upstream or not local:
-        # Live-git lookup failed (e.g. shallow clone without origin/main).
+        # Live-git lookup failed (e.g. shallow clone without origin/firefly-main).
         return _baked_banner_state()
-    ahead = source_check._git_count(["rev-list", "--count", "origin/main..HEAD"], cwd=repo_dir) or 0
+    base = f"origin/{source_check.DEFAULT_UPDATE_BRANCH}"
+    ahead = source_check._git_count(["rev-list", "--count", f"{base}..HEAD"], cwd=repo_dir) or 0
     return {"upstream": upstream, "local": local, "ahead": max(ahead, 0)}
 
 
@@ -533,8 +546,8 @@ def format_banner_version_label() -> str:
     upstream, local = state["upstream"], state["local"]
     ahead = int(state.get("ahead") or 0)
     if ahead <= 0 or upstream == local:
-        return f"{base} · upstream {upstream}"
-    return f"{base} · upstream {upstream} · local {local} (+{ahead} carried {_plural(ahead, 'commit')})"
+        return f"{base} · firefly-main {upstream}"
+    return f"{base} · firefly-main {upstream} · local {local} (+{ahead} carried {_plural(ahead, 'commit')})"
 
 
 # === Non-blocking update check ===

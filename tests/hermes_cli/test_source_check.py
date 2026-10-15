@@ -316,8 +316,7 @@ def test_running_revision_is_not_applied_to_an_explicit_target(installation, mon
     assert check_for_updates(install_root=linked, home=home)["currentSha"] == head
     # Default invocation retains the Nix revision probe even without a Git checkout.
     monkeypatch.setattr("hermes_cli.config.get_project_root", lambda: home)
-    responses[MAIN_CHANNEL] = (200, source_channel("main", "NousResearch/hermes-agent"))
-    responses["/repos/NousResearch/hermes-agent/commits/main"] = (200, "e" * 40)
+    responses["/repos/Kamisato-Yuna/hermes-agent/commits/firefly-main"] = (200, "e" * 40)
     assert check_for_updates(home=home)["behind"] == 0
 
 
@@ -450,20 +449,20 @@ def test_embedded_revision_keeps_https_ref_advertisement_recovery(installation, 
     monkeypatch.setenv("HERMES_REVISION", head)
     monkeypatch.setattr("hermes_cli.config.get_project_root", lambda: home)
     monkeypatch.setattr("hermes_cli.config.detect_install_method", lambda root: "nix")
-    responses[MAIN_CHANNEL] = (200, source_channel("main", "NousResearch/hermes-agent"))
+    responses[MAIN_CHANNEL] = (200, source_channel("main", "Kamisato-Yuna/hermes-agent"))
     original = subprocess.run
     probes = []
 
     def advertise(args, **kwargs):
         if "ls-remote" in args:
             probes.append((args, kwargs))
-            return subprocess.CompletedProcess(args, 0, head + "\trefs/heads/main\n", "")
+            return subprocess.CompletedProcess(args, 0, head + "\trefs/heads/firefly-main\n", "")
         return original(args, **kwargs)
 
     monkeypatch.setattr(subprocess, "run", advertise)
     assert check_for_updates(home=home)["behind"] == 0
     assert len(probes) == 1
-    assert "https://github.com/NousResearch/hermes-agent.git" in probes[0][0]
+    assert "https://github.com/Kamisato-Yuna/hermes-agent.git" in probes[0][0]
     assert probes[0][1]["stdin"] == subprocess.DEVNULL
     assert probes[0][1]["env"]["GIT_TERMINAL_PROMPT"] == "0"
 
