@@ -102,9 +102,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR: ${{ github.event.pull_request.number }}
         run: |
           set -uo pipefail
-          for workflow in ci.yaml docker.yml nix.yml; do
+          for workflow in ci-orchestrator.yaml docker.yml nix.yml; do
             RUN_ID=$(gh run list --repo "$REPO" --commit "$HEAD_SHA" --workflow "$workflow" \
               --event pull_request --limit 1 --json databaseId --jq '.[0].databaseId // empty' || true)
             if [ -z "$RUN_ID" ]; then
@@ -121,6 +122,12 @@ jobs:
                 [ "$STATUS" = completed ] && break
                 sleep 5
               done
+            fi
+            # Never rerun a run for a superseded PR head.
+            CURRENT_HEAD=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid || true)
+            if [ "$CURRENT_HEAD" != "$HEAD_SHA" ]; then
+              echo "PR head moved to $CURRENT_HEAD; not rerunning superseded $workflow run $RUN_ID."
+              exit 0
             fi
             if gh run rerun "$RUN_ID" --repo "$REPO"; then
               echo "$workflow: rerunning $RUN_ID"

@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 from hermes_cli import source_check
 # Historical updater import (tests/compat/old_updater_surface.json). In-tree callers use the owner.
-from hermes_cli.source_check import _github_compare_behind  # noqa: F401
+from hermes_cli.source_check import _github_compare_behind
 from hermes_constants import get_hermes_home
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -124,7 +124,7 @@ def _memo(cache_name: str, compute):
     return value
 
 
-def get_available_skills() -> Dict[str, List[str]]:
+def get_available_skills() -> dict[str, list[str]]:
     """Return skills grouped by category, filtered by platform and disabled state.
 
     Cached per-process (the skills-tree walk costs ~100ms and feeds only the startup banner);
@@ -138,7 +138,7 @@ def get_available_skills() -> Dict[str, List[str]]:
         all_skills = _quiet(_scan)
         if all_skills is None:
             return _UNCACHED
-        skills_by_category: Dict[str, List[str]] = {}
+        skills_by_category: dict[str, list[str]] = {}
         for skill in all_skills:
             skills_by_category.setdefault(skill.get("category") or "general", []).append(skill["name"])
         return skills_by_category
@@ -206,7 +206,7 @@ def _git_run(args: list[str], *, cwd: Optional[Path] = None, timeout: int = 5, t
     try:
         return subprocess.run(
             ["git", *args], capture_output=True, timeout=timeout, cwd=str(cwd) if cwd is not None else None,
-            **(_GIT_TEXT_KW if text else {}), **kwargs)
+            check=False, **(_GIT_TEXT_KW if text else {}), **kwargs)
     except Exception:
         return None
 
@@ -236,7 +236,7 @@ def _is_full_sha(value: Optional[str]) -> bool:
     return isinstance(value, str) and len(value) == 40 and all(c in "0123456789abcdefABCDEF" for c in value)
 
 
-_compare_payload_cache: Dict[tuple, dict] = {}
+_compare_payload_cache: dict[tuple, dict] = {}
 
 
 def _github_compare(current_rev: str, target_rev: str) -> Optional[dict]:
@@ -251,7 +251,10 @@ def _github_compare(current_rev: str, target_rev: str) -> Optional[dict]:
     key = (current_rev, target_rev)
     if key in _compare_payload_cache:
         return _compare_payload_cache[key]
-    url = f"https://api.github.com/repos/nousresearch/hermes-agent/compare/{current_rev}...{target_rev}"
+    url = (
+        f"https://api.github.com/repos/{source_check.DEFAULT_UPDATE_REPOSITORY}"
+        f"/compare/{current_rev}...{target_rev}"
+    )
 
     def _fetch():
         import urllib.request
@@ -274,8 +277,8 @@ def _github_compare_behind(current_rev: str, target_rev: str) -> Optional[int]:
     return ahead if isinstance(ahead, int) and not isinstance(ahead, bool) and ahead >= 0 else None
 
 
-def upstream_commits_behind(n: int = 20) -> List[Dict[str, Any]]:
-    """Commits between the last checked HEAD and upstream tip, newest first; [] when unknown.
+def upstream_commits_behind(n: int = 20) -> list[dict[str, Any]]:
+    """Commits between the last checked HEAD and firefly-main tip, newest first; [] when unknown.
 
     Reads the tips recorded by ``check_for_updates`` so it costs no extra request when the
     compare payload is already memoized for this process.
@@ -285,13 +288,13 @@ def upstream_commits_behind(n: int = 20) -> List[Dict[str, Any]]:
     if not head_rev or not target_rev or head_rev == target_rev:
         return []
     payload = _github_compare(head_rev, target_rev)
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
     for entry in (payload or {}).get("commits", []) if isinstance(payload, dict) else []:
         commit = entry.get("commit") or {}
         when = ((commit.get("committer") or {}).get("date") or "")
         try:
             from datetime import datetime
-            at = int(datetime.fromisoformat(when.replace("Z", "+00:00")).timestamp()) if when else 0
+            at = int(datetime.fromisoformat(when).timestamp()) if when else 0
         except ValueError:
             at = 0
         rows.append({
@@ -338,25 +341,29 @@ def _github_branch_tip(repo_slug: str, branch: str) -> Optional[str]:
 
 
 def _upstream_main_sha() -> Optional[str]:
-    """Tip SHA of upstream main; API first, HTTPS ``ls-remote`` (no auth, no prompts) as fallback."""
-    sha = _github_branch_tip(_OFFICIAL_REPO_CANONICAL.removeprefix("github.com/"), "main")
+    """Tip SHA of the fork's firefly-main update branch; API first, HTTPS ls-remote fallback."""
+    sha = _github_branch_tip(
+        source_check.DEFAULT_UPDATE_REPOSITORY, source_check.DEFAULT_UPDATE_BRANCH)
     if sha:
         return sha
-    result = _git_run(["ls-remote", _UPSTREAM_REPO_URL, "refs/heads/main"], timeout=10, network=True)
+    result = _git_run(
+        ["ls-remote", _UPSTREAM_REPO_URL,
+         f"refs/heads/{source_check.DEFAULT_UPDATE_BRANCH}"],
+        timeout=10, network=True)
     if result is None or result.returncode != 0 or not result.stdout:
         return None
     return result.stdout.split()[0] or None
 
 
 def _check_via_rev(local_rev: str) -> Optional[int]:
-    """Compare an embedded git revision to upstream main via the API (see ``_tips_behind``)."""
+    """Compare an embedded git revision to the firefly-main update tip via GitHub API."""
     global _last_target_rev
     _last_target_rev = _upstream_main_sha()
     return _tips_behind(local_rev, _last_target_rev)
 
 
 def _check_via_local_git(repo_dir: Path) -> Optional[int]:
-    """Count commits behind origin/main in a local checkout.
+    """Count commits behind origin/firefly-main in a local checkout.
 
     Passive checks never run ``git fetch``: every CLI/TUI/gateway start used to negotiate a pack
     with GitHub, and across the install base that was tens of millions of fetch requests a day
@@ -365,23 +372,24 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     the compare API when they differ. ``git fetch`` happens only inside ``hermes update``.
     """
     # Probe the origin URL under the config-isolated env: a global url.<https>.insteadOf rewrite
-    # otherwise makes an SSH origin masquerade as HTTPS (#104591).
+    # otherwise makes an SSH origin masquerade as HTTPS.
     origin_url = _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir, network=True)
     head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
     if not head_rev:
         return None
     canonical = _canonical_github_remote(origin_url)
+    branch = source_check.DEFAULT_UPDATE_BRANCH
     if canonical.startswith("github.com/"):
-        target_rev = _github_branch_tip(canonical.removeprefix("github.com/"), "main")
+        target_rev = _github_branch_tip(canonical.removeprefix("github.com/"), branch)
     else:
-        # Non-GitHub origin: one ls-remote for the tip (ref advertisement only, no pack transfer).
-        result = _git_run(["ls-remote", "origin", "refs/heads/main"], cwd=repo_dir, timeout=10, network=True)
+        # Non-GitHub origin: one ls-remote for the firefly-main tip (ref advertisement only, no pack transfer).
+        result = _git_run(["ls-remote", "origin", f"refs/heads/{branch}"], cwd=repo_dir, timeout=10, network=True)
         target_rev = result.stdout.split()[0] if result is not None and result.returncode == 0 and result.stdout else None
     global _last_target_rev
     _last_target_rev = target_rev
-    # Tip SHAs alone can't distinguish "behind" from a local commit AHEAD of origin/main, and
+    # Tip SHAs alone can't distinguish "behind" from a local commit AHEAD of origin/firefly-main, and
     # misreporting an ahead checkout nudges the user into `hermes update`, which can wipe carried
-    # work — hence the ancestor check inside _tips_behind, against the FRESH upstream SHA.
+    # work — hence the ancestor check inside _tips_behind, against the FRESH firefly-main SHA.
     return _tips_behind(head_rev, target_rev, repo_dir)
 
 
@@ -394,8 +402,9 @@ def _read_json(path: Path) -> Optional[dict]:
 def check_for_updates(*, passive: bool = False) -> Optional[int]:
     """Check whether a Hermes update is available.
 
-    If ``HERMES_REVISION`` is set (nix builds embed it), compare it to upstream main; otherwise
-    compare the local checkout's HEAD. Both go through the GitHub API, never ``git fetch``.
+    If ``HERMES_REVISION`` is set, compare it to the fork's firefly-main tip; otherwise
+    compare the local checkout's HEAD with the same update target. Both paths use the GitHub API,
+    never ``git fetch``.
     """
     def _read_config_opt_out():
         from hermes_cli.config import load_config
@@ -423,7 +432,8 @@ def check_for_updates(*, passive: bool = False) -> Optional[int]:
     head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir) if repo_dir is not None else None
     cached = _read_json(cache_file)
     if cached is not None and cached.get("rev") == embedded_rev and cached.get("ver") == VERSION \
-            and cached.get("head") == head_rev:
+            and cached.get("head") == head_rev \
+            and cached.get("target_branch") == source_check.DEFAULT_UPDATE_BRANCH:
         ttl = _UPDATE_CHECK_CACHE_SECONDS if cached.get("behind") is not None else _UPDATE_CHECK_FAILURE_CACHE_SECONDS
         if now - cached.get("ts", 0) < ttl:
             return cached.get("behind")
@@ -434,7 +444,8 @@ def check_for_updates(*, passive: bool = False) -> Optional[int]:
         behind = _check_via_local_git(repo_dir) if repo_dir is not None else None
     _quiet(lambda: cache_file.write_text(
         json.dumps({"ts": now, "behind": behind, "rev": embedded_rev, "ver": VERSION,
-                    "head": head_rev or embedded_rev, "target": _last_target_rev}),
+                    "head": head_rev or embedded_rev, "target": _last_target_rev,
+                    "target_branch": source_check.DEFAULT_UPDATE_BRANCH}),
         encoding="utf-8"))
     return behind
 
@@ -475,11 +486,13 @@ def _compute_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]
     repo_dir = repo_dir or _resolve_repo_dir()
     if repo_dir is None:
         return _baked_banner_state()
-    upstream, local = (source_check._git_stdout(["rev-parse", "--short=8", rev], cwd=repo_dir) for rev in ("origin/main", "HEAD"))
+    upstream, local = (source_check._git_stdout(["rev-parse", "--short=8", rev], cwd=repo_dir)
+                       for rev in (f"origin/{source_check.DEFAULT_UPDATE_BRANCH}", "HEAD"))
     if not upstream or not local:
-        # Live-git lookup failed (e.g. shallow clone without origin/main).
+        # Live-git lookup failed (e.g. shallow clone without origin/firefly-main).
         return _baked_banner_state()
-    ahead = source_check._git_count(["rev-list", "--count", "origin/main..HEAD"], cwd=repo_dir) or 0
+    base = f"origin/{source_check.DEFAULT_UPDATE_BRANCH}"
+    ahead = source_check._git_count(["rev-list", "--count", f"{base}..HEAD"], cwd=repo_dir) or 0
     return {"upstream": upstream, "local": local, "ahead": max(ahead, 0)}
 
 
@@ -533,8 +546,8 @@ def format_banner_version_label() -> str:
     upstream, local = state["upstream"], state["local"]
     ahead = int(state.get("ahead") or 0)
     if ahead <= 0 or upstream == local:
-        return f"{base} · upstream {upstream}"
-    return f"{base} · upstream {upstream} · local {local} (+{ahead} carried {_plural(ahead, 'commit')})"
+        return f"{base} · firefly-main {upstream}"
+    return f"{base} · firefly-main {upstream} · local {local} (+{ahead} carried {_plural(ahead, 'commit')})"
 
 
 # === Non-blocking update check ===
@@ -724,7 +737,7 @@ def banner_snapshot_fingerprint() -> Optional[str]:
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
 
-def load_banner_snapshot(enabled_toolsets: List[str] = None) -> Optional[Dict[str, Any]]:
+def load_banner_snapshot(enabled_toolsets: list[str] | None = None) -> Optional[dict[str, Any]]:
     """Return the stored banner snapshot when its fingerprint is current."""
     blob = _quiet(lambda: json.loads(_banner_snapshot_path().read_text(encoding="utf-8-sig")))
     if not isinstance(blob, dict):
@@ -739,8 +752,8 @@ def load_banner_snapshot(enabled_toolsets: List[str] = None) -> Optional[Dict[st
     return blob
 
 
-def save_banner_snapshot(tools: List[dict], enabled_toolsets: List[str], availability: Dict[str, Any],
-                         toolset_map: Dict[str, str]) -> None:
+def save_banner_snapshot(tools: list[dict], enabled_toolsets: list[str], availability: dict[str, Any],
+                         toolset_map: dict[str, str]) -> None:
     """Persist the banner tool panel inputs for next launch (best-effort)."""
     fp = banner_snapshot_fingerprint()
     if not fp:
@@ -763,7 +776,7 @@ def save_banner_snapshot(tools: List[dict], enabled_toolsets: List[str], availab
     _quiet(_write)
 
 
-def compute_toolset_availability(enabled_toolsets: List[str] = None) -> Dict[str, Any]:
+def compute_toolset_availability(enabled_toolsets: list[str] | None = None) -> dict[str, Any]:
     """Compute ``{"unavailable_toolsets", "lazy_tools", "disabled_tools"}`` for the banner.
 
     Split out so the result can be snapshotted and replayed without importing ``model_tools``.
@@ -812,17 +825,17 @@ def _mcp_failed_line(name: str, transport: str, error: Optional[str]) -> str:
     exact next command, so 'failed' is never the whole story."""
     from rich.markup import escape
     reason = escape(" ".join(str(error or "").split())[:120]) or "no details recorded"
-    next_cmd = (f"hermes mcp login {name}" if re.search(r"\b401\b|unauthori[sz]ed", reason, re.I)
+    next_cmd = (f"hermes mcp login {name}" if re.search(r"\b401\b|unauthori[sz]ed", reason, re.IGNORECASE)
                 else f"hermes mcp test {name}")
     return (f"[red]{name}[/] [dim]({transport})[/] [red]— could not connect:[/] {reason} "
             f"[dim]— run `{next_cmd}`[/]")
 
 
-def _truncate_tool_names(tool_names: List[str]) -> List[Optional[str]]:
+def _truncate_tool_names(tool_names: list[str]) -> list[Optional[str]]:
     """Cut a toolset's tool list to ~42 columns; ``None`` marks the elided tail."""
     if len(", ".join(tool_names)) <= 45:
         return list(tool_names)
-    short_names: List[Optional[str]] = []
+    short_names: list[Optional[str]] = []
     length = 0
     for name in tool_names:
         if length + len(name) + 2 > 42:
@@ -833,9 +846,9 @@ def _truncate_tool_names(tool_names: List[str]) -> List[Optional[str]]:
     return short_names
 
 
-def _pack_skill_names(skill_names: List[str], avail: int) -> str:
+def _pack_skill_names(skill_names: list[str], avail: int) -> str:
     """Join skill names into ``avail`` columns, ending with ``+N more`` when they don't all fit."""
-    parts: List[str] = []
+    parts: list[str] = []
     length = 0
     for i, name in enumerate(skill_names):
         needed = (2 if parts else 0) + len(name)
@@ -892,16 +905,6 @@ def _active_profile_name() -> Optional[str]:
     return get_active_profile_name()
 
 
-def _route_model_for_banner(provider: Any) -> str:
-    """The model the resolved route will actually serve when config names none: today only the Nous
-    free tier (welcome host -> ``nous/welcome``). Read from the boot record and local auth state;
-    no network. Empty when nothing resolves, so the caller keeps its "no model configured" line."""
-    if (provider or "auto").strip().lower() not in ("auto", "nous"):
-        return ""
-    from hermes_cli.anon_auth import GUEST_MODEL, free_tier_route
-    return GUEST_MODEL if free_tier_route() else ""
-
-
 def _banner_left_lines(model: str, cwd: str, session_id, context_length, provider, *, accent: str, dim: str,
                        context_pinned: bool = False) -> list:
     """Model / cwd / session lines under the hero art. ``context_pinned`` marks a
@@ -912,10 +915,6 @@ def _banner_left_lines(model: str, cwd: str, session_id, context_length, provide
     pin = " (pinned)" if context_pinned else ""
     ctx_str = _dim_sep(f"{_format_context_length(context_length)} context{pin}") if context_length else ""
     nous_str = _dim_sep("Nous Research")
-    if not (model or "").strip():
-        # Credentials resolve lazily on the first message; the banner prints first. Ask the route
-        # the same question so a fresh free-tier install shows its model, not a red "unconfigured".
-        model = _quiet(lambda: _route_model_for_banner(provider), "") or model
     if (provider or "").strip().lower() == "moa":
         # MoA virtual provider: ``model`` is a preset name; show it with its aggregator.
         agg_label = _quiet(lambda: _moa_aggregator_label(model), "")
@@ -940,7 +939,7 @@ def _banner_tool_lines(
     lazy_tools: set, disabled_tools: set, accent: str, dim: str, text: str) -> list:
     """"Available Tools" section: up to 8 toolsets, each truncated to ~42 columns."""
     lines = [f"[bold {accent}]Available Tools[/]"]
-    toolsets_dict: Dict[str, list] = {}
+    toolsets_dict: dict[str, list] = {}
     for tool in tools:
         tool_name = tool["function"]["name"]
         toolset = _display_toolset_name(get_toolset_for_tool(tool_name) or "other")
@@ -965,7 +964,7 @@ def _banner_tool_lines(
     return lines
 
 
-def _banner_skill_lines(skills_by_category: Dict[str, List[str]], skills_enabled: bool, *, dim: str, text: str) -> list:
+def _banner_skill_lines(skills_by_category: dict[str, list[str]], skills_enabled: bool, *, dim: str, text: str) -> list:
     """"Available Skills" body, sized to ~60% of the terminal width (the right grid column)."""
     if not skills_enabled:
         return [f"[dim {dim}]Skills toolset disabled[/]"]
@@ -981,9 +980,9 @@ def _banner_skill_lines(skills_by_category: Dict[str, List[str]], skills_enabled
 
 
 def build_welcome_banner(
-    console: "Console", model: str, cwd: str, tools: List[dict] = None, enabled_toolsets: List[str] = None,
-    session_id: str = None, get_toolset_for_tool=None, context_length: int = None, provider: str = None,
-    availability: Dict[str, Any] = None, skills_by_category: Dict[str, List[str]] = None,
+    console: "Console", model: str, cwd: str, tools: list[dict] | None = None, enabled_toolsets: list[str] | None = None,
+    session_id: str | None = None, get_toolset_for_tool=None, context_length: int | None = None, provider: str | None = None,
+    availability: dict[str, Any] | None = None, skills_by_category: dict[str, list[str]] | None = None,
     context_pinned: bool = False,
 ):
     """Build and print a welcome banner with caduceus on left and info on right.
