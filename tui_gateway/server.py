@@ -43,6 +43,8 @@ from tui_gateway.checkpoints import (_load_checkpoints_enabled, _resolve_checkpo
                                      resolve_checkpoints_enabled as _resolve_checkpoints_enabled)
 from tui_gateway._env import env_float, env_int
 from tui_gateway.turn_marker import clear_turn_marker, marker_writer_state, read_turn_marker, record_turn_start
+from tui_gateway.methods_voice import _release_gateway_wake_owner
+from tui_gateway.session_reaper import _flush_sessions_before_exit, _stop_turns_before_exit
 from tui_gateway.contracts import registry as _contracts
 # User-facing copy shared with the split method modules (they close over this namespace).
 from tui_gateway.user_messages import (
