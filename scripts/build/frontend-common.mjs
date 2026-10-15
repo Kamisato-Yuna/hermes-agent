@@ -65,10 +65,12 @@ export function productOutput(source, out, inputs) {
   // In-tree products have explicit homes; everything else under source is an
   // input, even when this particular compiler does not read it.
   const generated = developerOutput(src, dest)
-    || ['.build', 'apps/desktop/build/products'].some(name => {
+    || ['.build', 'apps/desktop/build/products', 'apps/desktop/build/native-deps'].some(name => {
       const root = path.join(src, name)
       return dest !== root && contains(root, dest)
     })
+    || (src && path.dirname(dest) === path.join(src, 'apps/desktop/build')
+        && /^native-deps(?:-|$)/.test(path.basename(dest)))
   if (contains(src, dest) && !generated) throw new Error(`Output must be outside source or in a supported generated destination: ${out}`)
   requireOwnedOutput(out, src)
   return { source: src, out: dest }
