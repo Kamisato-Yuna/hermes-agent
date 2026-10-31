@@ -31,10 +31,16 @@ function contains(parent, child) {
 
 const productMarker = '.hermes-product'
 const productOwner = 'hermes-frontend-product-v1\n'
-const developerOutputs = ['ui-tui/dist', 'hermes_cli/web_dist', 'apps/desktop/dist', 'apps/desktop/build/native-deps']
+const developerOutputs = ['ui-tui/dist', 'hermes_cli/web_dist', 'apps/desktop/dist', 'apps/desktop/dist-webapp', 'apps/desktop/build/native-deps']
+
+// `npm run builder -- --<platform> --<arch>` stages one native tree per target
+// (apps/desktop/scripts/run-electron-builder.mjs): build/native-deps-<platform>-<arch>.
+const nativeTargetOutput = /^apps[\\/]desktop[\\/]build[\\/]native-deps-(darwin|linux|win32)-(x64|arm64)$/
 
 function developerOutput(source, out) {
-  return source && developerOutputs.some(name => path.resolve(out) === path.join(path.resolve(source), name))
+  if (!source) return false
+  const relative = path.relative(path.resolve(source), path.resolve(out))
+  return developerOutputs.some(name => relative === path.join(name)) || nativeTargetOutput.test(relative)
 }
 
 // A destination name alone does not confer ownership of its existing contents.
@@ -65,10 +71,12 @@ export function productOutput(source, out, inputs) {
   // In-tree products have explicit homes; everything else under source is an
   // input, even when this particular compiler does not read it.
   const generated = developerOutput(src, dest)
-    || ['.build', 'apps/desktop/build/products'].some(name => {
+    || ['.build', 'apps/desktop/build/products', 'apps/desktop/build/native-deps'].some(name => {
       const root = path.join(src, name)
       return dest !== root && contains(root, dest)
     })
+    || (src && path.dirname(dest) === path.join(src, 'apps/desktop/build')
+        && /^native-deps(?:-|$)/.test(path.basename(dest)))
   if (contains(src, dest) && !generated) throw new Error(`Output must be outside source or in a supported generated destination: ${out}`)
   requireOwnedOutput(out, src)
   return { source: src, out: dest }
