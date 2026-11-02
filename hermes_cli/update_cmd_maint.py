@@ -854,6 +854,9 @@ def _sync_profiles_after_update() -> None:
         if backfilled:
             print()
             print(f"→ Seeded .env for {len(backfilled)} profile(s) (empty placeholder): {', '.join(backfilled)}")
+            print("  Credentials were not copied from the default profile. Configure required credentials separately:")
+            for name in backfilled:
+                print(f"  • Run `hermes -p {name} config env-path` to locate its .env, then add only the credentials it needs.")
 
     with suppress(Exception):
         from plugins.memory import import_provider_module
