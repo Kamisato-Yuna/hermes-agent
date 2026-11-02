@@ -406,19 +406,27 @@ def _reset_session_model_override(sid: str, session: dict) -> dict:
     ``session.resume`` cannot restore the old pin. History is kept."""
     from agent.i18n import t
     had_override = bool(session.get("model_override"))
+    reset_keys = ("model_override", "one_turn_model_restore", "config_model_seen", "composer_override_profile")
+    previous = {key: session[key] for key in reset_keys if key in session}
     session.pop("model_override", None)
     session.pop("one_turn_model_restore", None)
     session.pop("config_model_seen", None)  # the pinned sync recorded the target without adopting it
     if "composer_override_profile" in session:
         session["composer_override_profile"] = None  # persisted as a removal
-    model, provider = _config_model_target()
-    agent = session.get("agent")
-    if model and agent is not None and (
-            model != getattr(agent, "model", "") or (provider and provider != getattr(agent, "provider", ""))):
-        _apply_model_switch(
-            sid, session, f"{model} --provider {provider}" if provider else model,
-            confirm_expensive_model=True, pin_session_override=False, persist_override=False,
-            count_switch=False)
+    try:
+        model, provider = _config_model_target()
+        agent = session.get("agent")
+        if model and agent is not None and (
+                model != getattr(agent, "model", "") or (provider and provider != getattr(agent, "provider", ""))):
+            _apply_model_switch(
+                sid, session, f"{model} --provider {provider}" if provider else model,
+                confirm_expensive_model=True, pin_session_override=False, persist_override=False,
+                count_switch=False)
+    except Exception:
+        for key in reset_keys:
+            session.pop(key, None)
+        session.update(previous)
+        raise
     _persist_live_session_runtime(session)
     _emit_session_info(sid, session)
     shown = model or getattr(agent, "model", "") or t("gateway.shared.unknown_value")
