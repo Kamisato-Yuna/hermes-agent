@@ -277,13 +277,14 @@ def _expensive_model_confirm(result, current_base_url: str, current_api_key, age
     return {"value": result.new_model, "warning": msg, "confirm_required": True, "confirm_message": msg}
 
 
-def _commit_agent_switch(sid: str, session: dict, agent, result, current_model: str, snapshot):
+def _commit_agent_switch(sid: str, session: dict, agent, result, current_model: str, snapshot, *, runtime_pool=None, authoritative_runtime=False):
     """Swap the live agent in place, then restart/persist/mark/announce; a failed swap aborts."""
     try:
         agent.switch_model(
             new_model=result.new_model, new_provider=result.target_provider, api_key=result.api_key,
             base_url=result.base_url, api_mode=result.api_mode,
-            capabilities=getattr(result, "runtime_capabilities", None))
+            capabilities=getattr(result, "runtime_capabilities", None),
+            **({"credential_pool": runtime_pool} if authoritative_runtime else {}))
     except Exception as exc:
         # The in-place swap rolled the agent back and re-raised. Abort the whole commit (worker
         # restart, persist, marker, override, config write) or the session pins a broken model.
@@ -291,6 +292,9 @@ def _commit_agent_switch(sid: str, session: dict, agent, result, current_model: 
         # a session model_override, or persist to config — all of which would otherwise leave the session
         # pinned to a broken model and kill the conversation on the next turn (#50163). A failed switch is a
         # no-op; surface a clean error to the client.
+        if authoritative_runtime:
+            logger.warning("Configured model runtime unavailable (%s)", type(exc).__name__)
+            raise ValueError("Configured model runtime unavailable; staying on the previous model.") from None
         logger.warning("In-place model switch failed for TUI agent: %s", exc)
         raise ValueError(f"Model switch to {result.new_model} failed ({exc}); "
                          f"staying on {getattr(agent, 'model', current_model)}.") from exc
@@ -416,12 +420,25 @@ def _reset_session_model_override(sid: str, session: dict) -> dict:
     try:
         model, provider = _config_model_target()
         agent = session.get("agent")
-        if model and agent is not None and (
-                model != getattr(agent, "model", "") or (provider and provider != getattr(agent, "provider", ""))):
-            _apply_model_switch(
-                sid, session, f"{model} --provider {provider}" if provider else model,
-                confirm_expensive_model=True, pin_session_override=False, persist_override=False,
-                count_switch=False)
+        if model and agent is not None:
+            from hermes_cli.model_switch import ModelSwitchResult
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+            try:
+                runtime = resolve_runtime_provider(requested=provider or None, target_model=model)
+            except Exception as exc:
+                logger.warning("Configured model runtime resolution unavailable (%s)", type(exc).__name__)
+                raise ValueError("Configured model runtime unavailable; staying on the previous model.") from None
+            result = ModelSwitchResult(
+                success=True, new_model=model, target_provider=runtime.get("provider") or "",
+                base_url=runtime.get("base_url") or "", api_key=runtime.get("api_key") or "",
+                api_mode=runtime.get("api_mode") or "",
+                runtime_capabilities=runtime.get("runtime_capabilities"))
+            if (any(getattr(agent, key, "") != value for key, value in (
+                ("model", result.new_model), ("provider", result.target_provider),
+                ("base_url", result.base_url), ("api_key", result.api_key), ("api_mode", result.api_mode),
+            )) or getattr(agent, "_credential_pool", None) is not runtime.get("credential_pool")):
+                _commit_agent_switch(sid, session, agent, result, getattr(agent, "model", ""), None,
+                                     runtime_pool=runtime.get("credential_pool"), authoritative_runtime=True)
     except Exception:
         for key in reset_keys:
             session.pop(key, None)

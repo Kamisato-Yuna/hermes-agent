@@ -2125,6 +2125,10 @@ _SWITCH_SNAPSHOT_FIELDS = (
     "_config_context_length", "_reasoning_echo_flag", "runtime_capabilities",
     "_credential_pool", "_credential_pool_entry_id",
     "_codex_reasoning_replay_enabled", "_codex_reasoning_replay_rejected",
+    "_custom_providers", "_use_prompt_caching", "_use_native_cache_layout", "reasoning_config",
+    "_cached_system_prompt", "_primary_runtime", "_fallback_activated", "_provider_fallback_active",
+    "_provider_fallback_route", "_fallback_index", "_credential_pool_revert_id", "_fallback_chain",
+    "_fallback_model", "request_overrides",
 )
 _MISSING = object()
 
@@ -2136,13 +2140,25 @@ def _snapshot_switch_state(agent) -> dict[str, Any]:
     snapshot = {name: getattr(agent, name, _MISSING) for name in _SWITCH_SNAPSHOT_FIELDS}
     # Shallow-copy the dict so mutating the live one doesn't poison the rollback target.
     snapshot["_client_kwargs"] = dict(getattr(agent, "_client_kwargs", {}) or {})
+    cache = getattr(agent, "_transport_cache", _MISSING)
+    if isinstance(cache, dict):
+        snapshot["_transport_cache"] = dict(cache)
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is not None and hasattr(compressor, "__dict__"):
+        snapshot["__compressor_state"] = dict(compressor.__dict__)
     return snapshot
 
 
 def _restore_switch_snapshot(agent, snapshot: dict[str, Any]) -> None:
     for name, value in snapshot.items():
+        if name == "__compressor_state":
+            agent.context_compressor.__dict__.clear()
+            agent.context_compressor.__dict__.update(value)
+            continue
         if value is _MISSING:
-            continue  # attribute did not exist before the swap; don't fabricate it
+            with contextlib.suppress(AttributeError):
+                delattr(agent, name)
+            continue
         with contextlib.suppress(Exception):
             setattr(agent, name, value)
 
@@ -2188,7 +2204,7 @@ def _resolve_switch_destination(agent, new_model, new_provider, base_url, api_mo
     return api_mode, base_url, destination_capabilities
 
 
-def _build_switched_client(agent, new_provider, api_key, base_url, api_mode, new_norm) -> None:
+def _build_switched_client(agent, new_provider, api_key, base_url, api_mode, new_norm, authoritative=False) -> None:
     """Build the client for the switched-to destination (MoA facade / native Anthropic / OpenAI wire)."""
     if new_norm == "moa":
         from agent.moa_loop import bind_moa_runtime
@@ -2209,7 +2225,7 @@ def _build_switched_client(agent, new_provider, api_key, base_url, api_mode, new
         # Only fall back to ANTHROPIC_TOKEN for native Anthropic; other anthropic_messages providers
         # must never receive Anthropic credentials.
         is_native_anthropic = new_provider == "anthropic"
-        effective_key = api_key or agent.api_key or (
+        effective_key = api_key if authoritative else api_key or agent.api_key or (
             resolve_anthropic_token(model=getattr(agent, "model", None)) if is_native_anthropic else ""
         ) or ""
         # MiniMax OAuth: per-request callable token provider survives 15-min expiry (rationale in
@@ -2260,7 +2276,7 @@ def _build_switched_client(agent, new_provider, api_key, base_url, api_mode, new
     agent.client = agent._create_openai_client(dict(agent._client_kwargs), reason="switch_model", shared=True)
 
 
-def _swap_switch_runtime(agent, new_model, new_provider, api_key, base_url, api_mode, old_provider, old_norm, new_norm) -> None:
+def _swap_switch_runtime(agent, new_model, new_provider, api_key, base_url, api_mode, old_provider, old_norm, new_norm, credential_pool=_MISSING) -> None:
     """Swap identity/transport fields, reload the pool, rebuild the client (rolled back by the caller on error)."""
     # Clear the per-config override so the new model's context window is re-resolved.
     agent._config_context_length = None
@@ -2285,11 +2301,14 @@ def _swap_switch_runtime(agent, new_model, new_provider, api_key, base_url, api_
         agent._transport_cache.clear()
     from agent.turn_recovery_codex import reset_codex_reasoning_replay
     reset_codex_reasoning_replay(agent)
-    if api_key:
+    if api_key or credential_pool is not _MISSING:
         agent.api_key = api_key
     # Reload the credential pool on provider change: a pool with a mismatched provider makes
     # recover_with_credential_pool short-circuit. Reload failure is non-fatal.
-    if old_norm != new_norm or getattr(agent, "_credential_pool", None) is None:
+    if credential_pool is not _MISSING:
+        agent._credential_pool = credential_pool
+        agent._credential_pool_entry_id = None
+    elif old_norm != new_norm or getattr(agent, "_credential_pool", None) is None:
         # A pool bound to the old provider is worse than none: the recovery guard rejects it.
         agent._credential_pool = None
         agent._credential_pool_entry_id = None
@@ -2301,7 +2320,7 @@ def _swap_switch_runtime(agent, new_model, new_provider, api_key, base_url, api_
                 "switch_model: credential pool reload failed for %s (%s); "
                 "continuing without pool rotation this turn", new_provider, _pool_exc,
             )
-    _build_switched_client(agent, new_provider, api_key, base_url, api_mode, new_norm)
+    _build_switched_client(agent, new_provider, api_key, base_url, api_mode, new_norm, credential_pool is not _MISSING)
     sync_credential_pool_entry_id(agent)
 
 
@@ -2421,8 +2440,19 @@ def _persist_switch_billing_route(agent) -> None:
         logger.warning("Failed to persist billing route after model switch", exc_info=True)
 
 
-def switch_model(
-    agent, new_model, new_provider, api_key='', base_url='', api_mode='', capabilities=None
+def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mode='', capabilities=None, *, credential_pool=_MISSING):
+    """Switch transactionally, including setup after client construction."""
+    snapshot = _snapshot_switch_state(agent)
+    try:
+        return _switch_model_impl(agent, new_model, new_provider, api_key, base_url, api_mode,
+                                  capabilities, credential_pool=credential_pool)
+    except Exception:
+        _restore_switch_snapshot(agent, snapshot)
+        raise
+
+
+def _switch_model_impl(
+    agent, new_model, new_provider, api_key='', base_url='', api_mode='', capabilities=None, *, credential_pool=_MISSING
 ):
     """Switch the model/provider in-place for a live agent (rebuild clients, caching flags,
     compressor). Mirrors ``_try_activate_fallback()`` but also updates ``_primary_runtime`` so
@@ -2438,13 +2468,16 @@ def switch_model(
     # swallowed: the switch itself must still complete.
     old_norm = (old_provider or "").strip().lower()
     new_norm = (new_provider or "").strip().lower()
+    if credential_pool is not _MISSING and not base_url and getattr(agent, "base_url", "") and new_norm != "openai":
+        raise ValueError("switch_model: resolved runtime has no endpoint; refusing to reuse the previous endpoint")
     api_mode, base_url, destination_capabilities = _resolve_switch_destination(
         agent, new_model, new_provider, base_url, api_mode, capabilities, old_norm, new_norm
     )
+
     snapshot = _snapshot_switch_state(agent)
     try:
         _swap_switch_runtime(
-            agent, new_model, new_provider, api_key, base_url, api_mode, old_provider, old_norm, new_norm
+            agent, new_model, new_provider, api_key, base_url, api_mode, old_provider, old_norm, new_norm, credential_pool
         )
     except Exception:
         _restore_switch_snapshot(agent, snapshot)
