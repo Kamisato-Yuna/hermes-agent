@@ -31,9 +31,13 @@ class MCPServerRunMixin:
     async def _cancel_waiters(*tasks: asyncio.Task) -> None:
         for t in tasks:
             if not t.done():
-                t.cancel()
                 try:
+                    t.cancel()
                     await t
+                except RuntimeError as exc:
+                    # cancel() schedules callbacks and can fail after loop.close().
+                    if "Event loop is closed" not in str(exc):
+                        raise
                 except (asyncio.CancelledError, Exception):
                     pass
 

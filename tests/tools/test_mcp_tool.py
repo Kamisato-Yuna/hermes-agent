@@ -1332,6 +1332,27 @@ class TestGracefulFallback:
 
 class TestShutdown:
 
+    def test_cancel_waiter_suppresses_only_closed_loop_runtime_error(self):
+        from tools.mcp_tool_server_run import MCPServerRunMixin
+
+        class ClosedLoopTask:
+            def done(self):
+                return False
+
+            def cancel(self):
+                raise RuntimeError("Event loop is closed")
+
+        class OtherRuntimeErrorTask:
+            def done(self):
+                return False
+
+            def cancel(self):
+                raise RuntimeError("another shutdown error")
+
+        asyncio.run(MCPServerRunMixin._cancel_waiters(ClosedLoopTask()))
+        with pytest.raises(RuntimeError, match="another shutdown error"):
+            asyncio.run(MCPServerRunMixin._cancel_waiters(OtherRuntimeErrorTask()))
+
     def test_shutdown_drains_parked_server_after_bounded_wait_expires(self):
         """The public shutdown path drains a parked server if graceful shutdown stalls.
 
