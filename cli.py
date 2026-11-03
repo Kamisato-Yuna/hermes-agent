@@ -817,10 +817,11 @@ class _VoiceInputMessage:
     (#65827).
     """
 
-    __slots__ = ("text",)
+    __slots__ = ("text", "audio_profile")
 
-    def __init__(self, text: str):
+    def __init__(self, text: str, audio_profile: Optional[dict] = None):
         self.text = text
+        self.audio_profile = audio_profile
 
     def __str__(self) -> str:
         return self.text
@@ -871,6 +872,7 @@ class _ChatTurn:
     stop_event: Optional[threading.Event] = None
     tts_normal_exit: bool = False
     voice_prefix: str = ""
+    voice_audio_profile: Optional[dict] = None
 from hermes_cli.cli_chat_turn_mixin import CLIChatTurnMixin
 
 

@@ -98,8 +98,12 @@ class CLITuiRuntimeMixin:
     def _tui_process_one_input(self, user_input):
         """Route one submitted input: file drop, /resume pick, ! shell, slash command, or a chat turn."""
         from cli import _DIM, _PASTE_REF_RE, _RST, _cprint, _detect_file_drop, _looks_like_slash_command, _strip_leaked_bracketed_paste_wrappers, _strip_leaked_terminal_responses_with_meta
+        from cli import _VoiceInputMessage
         from tools.process_registry_notifications import TimelineNotification
         self._tui_dock_drop_dequeued()
+        voice_audio_profile = (
+            user_input.audio_profile if isinstance(user_input, _VoiceInputMessage) else None
+        )
         user_input, is_voice_input, is_seeded_query = self._tui_unwrap_input(user_input)
         if not user_input:
             return
@@ -159,7 +163,10 @@ class CLITuiRuntimeMixin:
         self._turn_summary_begin()
         self._app.invalidate()
         try:
-            self.chat(notification_preview or user_input, images=submit_images or None, voice_input=is_voice_input)
+            chat_kwargs = {"images": submit_images or None, "voice_input": is_voice_input}
+            if isinstance(voice_audio_profile, dict):
+                chat_kwargs["voice_audio_profile"] = voice_audio_profile
+            self.chat(notification_preview or user_input, **chat_kwargs)
         finally:
             self._tui_after_turn()
 

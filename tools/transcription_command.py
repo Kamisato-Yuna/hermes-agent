@@ -37,9 +37,10 @@ logger = logging.getLogger("tools.transcription_tools")
 # (always wins) > stt.providers.<name> command > plugin TranscriptionProvider >
 # "No STT provider available". The single-env-var HERMES_LOCAL_STT_COMMAND escape
 # hatch stays untouched via the built-in ``local_command`` path.
-# Lets any whisper CLI / ASR CLI / curl pipeline become an STT backend with zero Python. 1. Built-in
-# (``local``, ``local_command``, ``groq``, ``openai``, ``mistral``, ``xai``)              → native handler.
-# **Always wins.** 2. 3. 4. Use the command-provider registry when you want MULTIPLE shell-driven STT
+# Lets any whisper CLI / ASR CLI / curl pipeline become an STT backend with zero Python.
+# 1. Built-in (``local``, ``local_command``, ``local_mlx``, ``groq``, ``openai``, ``mistral``, ``xai``)
+#    is handled natively and always wins.
+# 2. Use the command-provider registry when you want MULTIPLE shell-driven STT
 # engines, or you want a named provider you can pick via ``stt.provider`` in config.yaml. See #17843.
 DEFAULT_COMMAND_STT_TIMEOUT_SECONDS = 300
 DEFAULT_COMMAND_STT_LANGUAGE = "en"

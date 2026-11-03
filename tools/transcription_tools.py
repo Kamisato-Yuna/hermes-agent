@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Speech-to-text transcription used by the gateway for voice messages.
 
-Built-in providers: local (faster-whisper, default/free), local_command, groq, openai
-(also serves the managed ``nous`` selection), mistral, xai, elevenlabs, deepinfra; plus
+Built-in providers: local (faster-whisper, default/free), local_command, local_mlx, groq,
+openai (also serves the managed ``nous`` selection), mistral, xai, elevenlabs, deepinfra; plus
 user-declared command providers and plugin providers. ``transcribe_audio(path)`` returns
 ``{"success", "transcript", "error"?, "provider"?}``. This module owns provider resolution,
 the dispatcher and the cached local model + idle-unload state; backends live in
@@ -23,7 +23,8 @@ from typing import Optional, Dict, Any
 
 from utils import is_truthy_value
 from tools.transcription_common import (
-    BUILTIN_STT_PROVIDERS, CLOUD_STT_PROVIDERS, DEFAULT_ELEVENLABS_STT_MODEL,
+    BUILTIN_STT_PROVIDERS, CLOUD_STT_PROVIDERS, LOCAL_STT_PROVIDERS,
+    DEFAULT_ELEVENLABS_STT_MODEL,
     DEFAULT_GROQ_STT_MODEL, DEFAULT_LOCAL_MODEL, DEFAULT_MISTRAL_STT_MODEL, DEFAULT_PROVIDER,
     DEFAULT_STT_MODEL, LOCAL_STT_COMMAND_ENV, LOCAL_STT_LANGUAGE_ENV,
     normalize_xai_stt_model, _error_result, _get_stt_section, _ok_result)
@@ -36,6 +37,10 @@ from tools.transcription_local import (
     _load_local_whisper_model, _looks_like_cuda_lib_error, _normalize_local_model,
     _normalize_local_stt_language, _transcribe_local_command, _try_lazy_install_stt,
     build_local_transcribe_kwargs)
+from tools.transcription_mlx import (
+    _transcribe_local_mlx, _transcribe_local_mlx_with_segments,
+    check_local_mlx_requirements, prewarm_local_mlx,
+    start_local_mlx_worker, stop_local_mlx_worker)
 # The ``_transcribe_<provider>`` handlers are looked up in this module's globals by _dispatch_stt_provider.
 from tools.transcription_cloud import (
     _has_xai_stt_credentials, _resolve_openai_audio_client_config, _transcribe_deepinfra,
@@ -132,7 +137,7 @@ def _has_openai_audio_backend() -> bool:
 
 def _is_local_stt_provider(provider: str, stt_config: dict[str, Any]) -> bool:
     """Whether *provider* is exempt from Hermes's remote upload cap."""
-    return (provider or "").lower().strip() in {"local", "local_command"}
+    return (provider or "").lower().strip() in LOCAL_STT_PROVIDERS
 
 
 # ---- Provider resolution ------------------------------------------------
@@ -266,6 +271,10 @@ def _get_provider(stt_config: dict) -> str:
         except Exception:  # pragma: no cover — helpers are in-repo
             pass
     if explicit:
+        if provider == "local_mlx":
+            # Keep the explicit selection visible so readiness can report the
+            # isolated runtime's actionable configuration errors.
+            return "local_mlx"
         return _resolve_explicit_provider(provider)
     backend = _detect_local_backend()
     if backend:
@@ -431,7 +440,13 @@ def _read_block_error(file_path: str) -> Optional[dict[str, Any]]:
 
 
 def _transcribe_prepared_audio(
-    file_path: str, model: Optional[str] = None, source: Optional[str] = None) -> dict[str, Any]:
+    file_path: str,
+    model: Optional[str] = None,
+    source: Optional[str] = None,
+    *,
+    cancel_event: Optional[threading.Event] = None,
+    mlx_worker: Optional[Any] = None,
+) -> dict[str, Any]:
     """Transcribe a validated audio file with the configured STT provider. ``model`` overrides the
     config default; ``source`` is a caller-surface label (``"gateway"``, ``"voice_mode"``) forwarded
     to the ``pre_transcription`` hook only."""
@@ -465,7 +480,15 @@ def _transcribe_prepared_audio(
                 hints = _resolve_dispatch_hints(file_path, provider, stt_config, model, source)
                 return transcribe_oversized(
                     file_path, limit, lambda part: _route_stt_provider(part, provider, stt_config, *hints))
-        return _dispatch_stt_provider(file_path, provider, stt_config, model, source)
+        return _dispatch_stt_provider(
+            file_path,
+            provider,
+            stt_config,
+            model,
+            source,
+            cancel_event=cancel_event,
+            mlx_worker=mlx_worker,
+        )
 
 
 def _limit_model_name(provider: str, stt_config: dict[str, Any], model: Optional[str]) -> Optional[str]:
@@ -478,6 +501,7 @@ def _limit_model_name(provider: str, stt_config: dict[str, Any], model: Optional
 _BUILTIN_MODEL_KEYS = {
     "local": ("local", "model", DEFAULT_LOCAL_MODEL, False),
     "local_command": ("local", "model", DEFAULT_LOCAL_MODEL, False),
+    "local_mlx": ("mlx", "model", "mlx-community/whisper-large-v3-mlx", False),
     "groq": ("groq", "model", DEFAULT_GROQ_STT_MODEL, True),
     "openai": ("openai", "model", DEFAULT_STT_MODEL, False),
     "mistral": ("mistral", "model", DEFAULT_MISTRAL_STT_MODEL, False),
@@ -513,15 +537,31 @@ def _resolve_dispatch_hints(
 
 def _dispatch_stt_provider(
     file_path: str, provider: str, stt_config: dict[str, Any], model: Optional[str] = None,
-    source: Optional[str] = None) -> dict[str, Any]:
+    source: Optional[str] = None, *, cancel_event: Optional[threading.Event] = None,
+    mlx_worker: Optional[Any] = None) -> dict[str, Any]:
     """Route *file_path* to the handler for *provider* (built-in > command > plugin)."""
     return _route_stt_provider(
-        file_path, provider, stt_config, *_resolve_dispatch_hints(file_path, provider, stt_config, model, source))
+        file_path, provider, stt_config,
+        *_resolve_dispatch_hints(file_path, provider, stt_config, model, source),
+        cancel_event=cancel_event,
+        mlx_worker=mlx_worker)
 
 
 def _route_stt_provider(
     file_path: str, provider: str, stt_config: dict[str, Any], model: Optional[str],
-    language: Optional[str], prompt: Optional[str]) -> dict[str, Any]:
+    language: Optional[str], prompt: Optional[str], *,
+    cancel_event: Optional[threading.Event] = None,
+    mlx_worker: Optional[Any] = None) -> dict[str, Any]:
+    if provider == "local_mlx":
+        mlx_cfg = _get_stt_section(stt_config, "mlx")
+        mlx_language = (
+            language or mlx_cfg.get("language")
+            or _resolve_stt_language("local_mlx", stt_config) or "zh"
+        )
+        return _transcribe_local_mlx_with_segments(
+            file_path, _builtin_model_name(provider, stt_config, model), mlx_cfg,
+            language=mlx_language, prompt=prompt, cancel_event=cancel_event,
+            mlx_worker=mlx_worker)
     if provider in BUILTIN_STT_PROVIDERS:
         # Looked up in this module at call time so tests may patch ``_transcribe_*``.
         handler = globals()[f"_transcribe_{provider}"]
@@ -564,7 +604,13 @@ def _no_provider_error(provider: str, stt_config: dict[str, Any]) -> dict[str, A
 
 
 def transcribe_audio(
-    file_path: str, model: Optional[str] = None, source: Optional[str] = None) -> dict[str, Any]:
+    file_path: str,
+    model: Optional[str] = None,
+    source: Optional[str] = None,
+    *,
+    cancel_event: Optional[threading.Event] = None,
+    mlx_worker: Optional[Any] = None,
+) -> dict[str, Any]:
     """Validate, preprocess supported inputs, and dispatch transcription. ``source`` is a caller-surface
     label (``"gateway"``, ``"voice_mode"``) forwarded to the ``pre_transcription`` hook only."""
     # Secret-store refusal runs before ANY validation so the error names the real reason.
@@ -582,7 +628,9 @@ def transcribe_audio(
         return prep_error or _error_result("Audio preprocessing did not produce a file for transcription.")
     try:
         return (_validate_audio_file(prepared_path, enforce_size_limit=False)
-                or _transcribe_prepared_audio(prepared_path, model, source))
+                or _transcribe_prepared_audio(
+                    prepared_path, model, source, cancel_event=cancel_event,
+                    mlx_worker=mlx_worker))
     finally:
         if cleanup_dir:
             shutil.rmtree(cleanup_dir, ignore_errors=True)

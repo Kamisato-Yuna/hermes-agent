@@ -83,6 +83,9 @@ class CLIVoiceMixin:
         with self._voice_lock:
             if self._voice_recording:
                 return
+            if not hasattr(self, "_voice_stt_cancel"):
+                self._voice_stt_cancel = threading.Event()
+            self._voice_stt_cancel.clear()
             self._voice_recording = True
 
         voice_cfg = _config_section("voice")
@@ -91,7 +94,11 @@ class CLIVoiceMixin:
         # failure or every future voice start is silently skipped by the guard above.
         if self._voice_recorder is None:
             try:
-                self._voice_recorder = create_audio_recorder()
+                input_device = voice_cfg.get("input_device")
+                if input_device is None:
+                    self._voice_recorder = create_audio_recorder()
+                else:
+                    self._voice_recorder = create_audio_recorder(device=input_device)
             except Exception:
                 with self._voice_lock:
                     self._voice_recording = False
@@ -190,7 +197,7 @@ class CLIVoiceMixin:
 
     def _voice_stop_and_transcribe(self):
         """Stop recording, transcribe via STT, and queue the transcript as input."""
-        from cli import _DIM, _RST, _VoiceInputMessage, _cprint
+        from cli import _DIM, _RST, _VoiceInputMessage, _cprint, logger
         # Atomic guard; _voice_processing is set immediately so concurrent Ctrl+B presses
         # don't race into the START path while recorder.stop() holds its lock.
         with self._voice_lock:
@@ -201,6 +208,7 @@ class CLIVoiceMixin:
 
         submitted = False
         transcription_failed = False
+        transcription_cancelled = False
         wav_path = None
         try:
             if self._voice_recorder is None:
@@ -219,8 +227,21 @@ class CLIVoiceMixin:
                 _cprint(f"{_DIM}{t('cli.voice.transcribing')}{_RST}")
             from tools.voice_mode_transcript import is_voice_stop_phrase
             from tools.voice_mode import transcribe_recording
-            result = transcribe_recording(wav_path, model=stt_model)
-            if result.get("success") and result.get("transcript", "").strip():
+            transcribe_kwargs = {
+                "model": stt_model,
+                "cancel_event": getattr(self, "_voice_stt_cancel", None),
+            }
+            mlx_worker = getattr(self, "_voice_mlx_worker", None)
+            if mlx_worker is not None:
+                transcribe_kwargs["mlx_worker"] = mlx_worker
+            result = transcribe_recording(wav_path, **transcribe_kwargs)
+
+            # A worker response can race with `/voice off`; never queue a late result.
+            stt_cancel = getattr(self, "_voice_stt_cancel", None)
+            if stt_cancel is not None and stt_cancel.is_set():
+                _cprint(f"\n{_DIM}Transcription cancelled.{_RST}")
+                transcription_cancelled = True
+            elif result.get("success") and result.get("transcript", "").strip():
                 transcript = result["transcript"].strip()
                 if is_voice_stop_phrase(transcript):
                     # Bare "stop" (or configured phrase) ends the voice chat, not a turn.
@@ -229,13 +250,23 @@ class CLIVoiceMixin:
                     return
                 self._attached_images.clear()
                 self._voice_invalidate()
-                self._pending_input.put(_VoiceInputMessage(transcript))
+                audio_profile = None
+                try:
+                    from tools.voice_audio_profile import analyze_recording
+                    audio_profile = analyze_recording(wav_path)
+                except Exception:
+                    logger.exception("Voice audio profile hook failed; continuing with transcript")
+                self._pending_input.put(_VoiceInputMessage(transcript, audio_profile))
                 submitted = True
             elif result.get("success"):
                 _cprint(f"{_DIM}{t('cli.voice.no_speech')}{_RST}")
             else:
-                _cprint(f"\n{_DIM}{t('cli.voice.transcription_failed', error=result.get('error') or t('cli.shared.unknown_error'))}{_RST}")
-                transcription_failed = True
+                if result.get("error_type") == "cancelled":
+                    _cprint(f"\n{_DIM}Transcription cancelled.{_RST}")
+                    transcription_cancelled = True
+                else:
+                    _cprint(f"\n{_DIM}{t('cli.voice.transcription_failed', error=result.get('error') or t('cli.shared.unknown_error'))}{_RST}")
+                    transcription_failed = True
         except Exception as e:
             _cprint(f"\n{_DIM}{t('cli.voice.processing_error', error=e)}{_RST}")
             transcription_failed = wav_path is not None
@@ -247,7 +278,7 @@ class CLIVoiceMixin:
             # On failure keep the source recording so long dictation is not lost.
             try:
                 if wav_path and os.path.isfile(wav_path):
-                    if transcription_failed:
+                    if transcription_failed and not transcription_cancelled:
                         _cprint(f"{_DIM}{t('cli.voice.recording_preserved', path=wav_path)}{_RST}")
                     else:
                         os.unlink(wav_path)
@@ -445,7 +476,17 @@ class CLIVoiceMixin:
         submitted = False
         try:
             from tools.voice_mode import transcribe_recording
-            result = transcribe_recording(wav_path, model=self._voice_stt_model())
+            transcribe_kwargs = {"model": self._voice_stt_model()}
+            stt_cancel = getattr(self, "_voice_stt_cancel", None)
+            mlx_worker = getattr(self, "_voice_mlx_worker", None)
+            if stt_cancel is not None:
+                transcribe_kwargs["cancel_event"] = stt_cancel
+            if mlx_worker is not None:
+                transcribe_kwargs["mlx_worker"] = mlx_worker
+            result = transcribe_recording(wav_path, **transcribe_kwargs)
+            if stt_cancel is not None and stt_cancel.is_set():
+                _cprint(f"\n{_DIM}Transcription cancelled.{_RST}")
+                return
             transcript = (result.get("transcript") or "").strip() if result.get("success") else ""
             if transcript:
                 from tools.voice_mode_transcript import is_voice_stop_phrase
@@ -462,7 +503,13 @@ class CLIVoiceMixin:
                             "Dropping playback-phase barge transcript as TTS echo: %r", transcript)
                         _cprint(f"\n{_DIM}{t('cli.voice.echo_ignored')}{_RST}")
                         return
-                self._pending_input.put(_VoiceInputMessage(transcript))
+                audio_profile = None
+                try:
+                    from tools.voice_audio_profile import analyze_recording
+                    audio_profile = analyze_recording(wav_path)
+                except Exception:
+                    logger.exception("Voice audio profile hook failed; continuing with transcript")
+                self._pending_input.put(_VoiceInputMessage(transcript, audio_profile))
                 submitted = True
             elif not result.get("success"):
                 _cprint(f"\n{_DIM}{t('cli.voice.transcription_failed', error=result.get('error') or t('cli.shared.unknown_error'))}{_RST}")
@@ -509,6 +556,35 @@ class CLIVoiceMixin:
                     _cprint(f"\n  {_BOLD}{t('cli.voice.termux_install_cmd')}{_RST}")
                     _cprint(f"  {_DIM}{t('cli.voice.termux_install_hint')}{_RST}")
             return
+
+        self._voice_mlx_worker = None
+        if reqs.get("stt_readiness") is not None:
+            stt_cfg = _config_section("stt")
+            mlx_cfg = stt_cfg.get("mlx")
+            mlx_cfg = mlx_cfg if isinstance(mlx_cfg, dict) else {}
+            from utils import is_truthy_value
+            prewarm = is_truthy_value(mlx_cfg.get("prewarm_on_voice_start", True), default=True)
+            _cprint(f"\n{_DIM}Starting local MLX Whisper worker...{_RST}")
+            try:
+                from tools.transcription_tools import start_local_mlx_worker
+                mlx_worker, worker_status = start_local_mlx_worker(stt_cfg, prewarm=prewarm)
+            except Exception as exc:
+                mlx_worker = None
+                worker_status = {"success": False, "error": f"MLX worker start failed: {exc}"}
+            if worker_status.get("success"):
+                self._voice_mlx_worker = mlx_worker
+                worker_pid = worker_status.get("worker_pid")
+                warmup_note = (
+                    "; model prewarmed" if worker_status.get("prewarm")
+                    else "; model loads on first utterance"
+                )
+                pid_note = f" (pid {worker_pid})" if worker_pid else ""
+                _cprint(f"{_DIM}Local MLX worker ready{pid_note}{warmup_note}.{_RST}")
+            else:
+                _cprint(
+                    f"{_ACCENT}MLX worker unavailable; using one-shot fallback:{_RST} "
+                    f"{_DIM}{worker_status.get('error', 'unknown error')}{_RST}"
+                )
 
         with self._voice_lock:
             self._voice_mode = True
@@ -563,13 +639,21 @@ class CLIVoiceMixin:
         return True
 
     def _disable_voice_mode(self):
-        """Disable voice mode, cancel any active recording, and stop TTS."""
+        """Disable voice mode, cancel active STT, stop the MLX worker and stop TTS."""
         from cli import _DIM, _RST, _cprint, logger
+        mlx_worker = None
         with self._voice_lock:
+            stt_cancel = getattr(self, "_voice_stt_cancel", None)
+            if stt_cancel is None:
+                stt_cancel = threading.Event()
+                self._voice_stt_cancel = stt_cancel
+            stt_cancel.set()
             if self._voice_recording and self._voice_recorder:
                 self._voice_recorder.cancel()
                 self._voice_recording = False
             recorder = self._voice_recorder
+            mlx_worker = getattr(self, "_voice_mlx_worker", None)
+            self._voice_mlx_worker = None
             self._voice_mode = False
             self._voice_tts = False
             self._voice_continuous = False
@@ -585,6 +669,12 @@ class CLIVoiceMixin:
                     pass
             threading.Thread(target=_bg_shutdown, daemon=True).start()
             self._voice_recorder = None
+        if mlx_worker is not None:
+            try:
+                from tools.transcription_tools import stop_local_mlx_worker
+                stop_local_mlx_worker(mlx_worker)
+            except Exception:
+                logger.debug("MLX worker shutdown failed", exc_info=True)
         # Stop any active TTS playback (file player + streaming pipeline)
         try:
             if self._voice_tts_stop is not None:
