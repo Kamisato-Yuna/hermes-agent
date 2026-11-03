@@ -1,5 +1,6 @@
 """Resolve explicit model changes using the existing source model switch pipeline."""
 import asyncio
+import hmac
 import json
 from dataclasses import asdict, replace
 from typing import NamedTuple
@@ -13,6 +14,9 @@ class _Route(NamedTuple):
     model: str
     base_url: str
     api_key: object  # a callable bearer (Azure Entra) stays callable
+    api_mode: object = None
+    runtime_provider: object = None
+    credential_pool: object = None
 
 
 def _current_route(authority, live, old):
@@ -39,7 +43,8 @@ def _current_route(authority, live, old):
             return config, _Route(block.get('provider') or '', old.current_model(authority) or '',
                                   block.get('base_url') or '', '')
     return config, _Route(block.get('provider') or runtime.get('provider') or '', model or '',
-                          runtime.get('base_url') or '', runtime.get('api_key') or '')
+                          runtime.get('base_url') or '', runtime.get('api_key') or block.get('api_key') or '',
+                          runtime.get('api_mode'), runtime.get('provider'), runtime.get('credential_pool'))
 
 
 async def prepare_model(authority, live, payload, prepared):
@@ -50,36 +55,63 @@ async def prepare_model(authority, live, payload, prepared):
     old = restore_policy(prepared['snapshot']['receipt']['policy'])
     config, current = _current_route(authority, live, old)
     reset = is_model_reset(payload)
+    reset_config = None
     if reset:
-        payload = await asyncio.to_thread(_reset_payload, authority, old, current)
+        payload, reset_config = await asyncio.to_thread(_reset_payload, authority, old)
         if 'status' in payload:
             return payload
     # A pick is an explicit user action: it resolves against the owning profile's CURRENT named
     # providers, as CLI/TUI ``/model`` do (#139740). A following session's ``config`` already is
     # the profile's current read; every other session keeps ``config`` for its own route below.
-    resolution = config if old.follows_profile else await asyncio.to_thread(
-        _provider_resolution_config, authority, config, old.ignore_user_config)
+    if reset:
+        resolution = await asyncio.to_thread(_provider_resolution_config, authority, reset_config)
+    else:
+        resolution = config if old.follows_profile else await asyncio.to_thread(
+            _provider_resolution_config, authority, config, old.ignore_user_config)
+
+    switch_current = current
+    if reset:
+        model_config = reset_config.get('model')
+        model_config = model_config if isinstance(model_config, dict) else {}
+        switch_current = _Route(payload.get('provider', ''), payload['model'],
+                                model_config.get('base_url') or '', model_config.get('api_key') or '')
 
     def switch(**kwargs):
         result = switch_model(**kwargs)
         return result, _alias_credential(authority, result)
     result, alias_credential = await asyncio.to_thread(switch, raw_input=payload['model'],
-        current_provider=current.provider, current_model=current.model, current_base_url=current.base_url,
-        current_api_key=current.api_key, explicit_provider=payload.get('provider', ''),
+        current_provider=switch_current.provider, current_model=switch_current.model,
+        current_base_url=switch_current.base_url, current_api_key=switch_current.api_key,
+        explicit_provider=payload.get('provider', ''),
         is_global=False, user_providers=resolution.get('providers'),
         custom_providers=get_compatible_custom_providers(resolution))
     if not result.success:
         raise RuntimeStoreError('model_resolution_failed')
+    reset_launch_key = route_launch_key(authority, old, config) if reset else None
+    if reset and _reset_matches_current(
+            current, result, payload.get('provider', ''), config, reset_config, old.model,
+            reset_launch_key):
+        from agent.i18n import t
+        return {'status': 'noop', 'model': result.new_model,
+                'note': t('cli.model.reset_none', model=result.new_model)}
     # The configured default is the user's own choice: a reset is never held behind a cost ask.
     refusal = None if reset else await _selection_guard_refusal(
         authority, live, payload, prepared['snapshot'], current, result)
     if refusal is not None:
         return refusal
     frozen = old.config()
+    reset_model_secrets = {}
+    if reset:
+        from copy import deepcopy
+        from gateway.session_policy import _extract_config_secrets
+        configured_model = reset_config.get('model')
+        frozen['model'] = deepcopy(configured_model) if isinstance(configured_model, dict) else {
+            'default': reset_config.get('model')}
+        _extract_config_secrets(frozen['model'], reset_model_secrets, ('model',))
     # The committed selection freezes the ONE picked endpoint (its key stays a private secret).
     provider_secrets, retired, moved = ({}, (), {}) if old.follows_profile else _freeze_selected_provider(
         resolution, frozen, result.target_provider)
-    if old.follows_profile:
+    if old.follows_profile and not reset:
         # A following session switches FROM the profile's current route: measured from its creation
         # endpoint, a pick on the current one read as a route change and dropped its key_env pointer.
         followed = config.get('model') or {}
@@ -135,6 +167,7 @@ async def prepare_model(authority, live, payload, prepared):
     # A cleared field's private value must not be re-hydrated into the new route by config().
     secrets = {path: value for path, value in secrets.items()
                if not (len(path) == 2 and path[0] == 'model' and path[1] not in frozen['model'])}
+    secrets.update(reset_model_secrets)
     if source:
         secrets.pop(('model', 'api_key'), None)
         secrets[source] = alias_key
@@ -144,7 +177,11 @@ async def prepare_model(authority, live, payload, prepared):
     # Measured on resolved routes (a respelled provider on one endpoint is one route; a named entry
     # whose base_url moved is another): the key survives only while it still authenticates the route
     # the session runs now and the pick stays on that route.
-    key = route_launch_key(authority, old, config)
+    key = reset_launch_key if reset else route_launch_key(authority, old, config)
+    if reset and key is not None and not _same_reset_key(key, result.api_key):
+        # An explicit session launch key can override the profile key on the same endpoint. Reset
+        # returns to the profile's credential source, so do not rebind that different launch key.
+        key = None
     if key is None or not bound_route_holds(config.get('model'), config, frozen['model'], config):
         policy = replace(policy, credential_ref=None)
         key = None
@@ -167,29 +204,74 @@ def is_model_reset(payload):
 
 
 def configured_default(authority):
-    """``(model, provider)`` the owning profile's config.yaml names now (``auto`` reads as no provider)."""
+    """Return the owning profile's configured model, provider, and current config."""
     from gateway.run import _resolve_gateway_model
     from gateway.session_policy import profile_config
     profile = profile_config(authority)
     block = profile.get('model')
     if not block:
-        return '', ''
+        return '', '', profile
     provider = str(block.get('provider') or '') if isinstance(block, dict) else ''
-    return _resolve_gateway_model(profile), '' if provider.lower() == 'auto' else provider
+    return _resolve_gateway_model(profile), '' if provider.lower() == 'auto' else provider, profile
 
 
-def _reset_payload(authority, old, current):
+def _reset_payload(authority, old):
     """``/model reset``: the pick becomes the owning profile's configured model, read fresh, so the
-    session runs (and, when following, keeps following) its profile again; history is kept. Returns a
-    ``noop`` report when the session already runs that model. A safe-mode session never read the
-    profile, so it has no configured default to return to."""
+    session runs (and, when following, keeps following) its profile again; history is kept. A safe-mode
+    session never read the profile, so it has no configured default to return to."""
     from agent.i18n import t
-    model, provider = ('', '') if old.ignore_user_config else configured_default(authority)
+    model, provider, profile = ('', '', {}) if old.ignore_user_config else configured_default(authority)
     if not model:
         raise RuntimeStoreError('invalid_params', field='payload.model', detail=t('cli.model.reset_no_default'))
-    if model == current.model and provider in ('', current.provider):
-        return {'status': 'noop', 'model': model, 'note': t('cli.model.reset_none', model=model)}
-    return {'model': model, **({'provider': provider} if provider else {})}
+    return {'model': model, **({'provider': provider} if provider else {})}, profile
+
+
+def _reset_matches_current(current, result, configured_provider, current_config, target_config, policy_model,
+                           launch_key=None):
+    """A reset is a no-op only when its full resolved route already matches the live route."""
+    if current.runtime_provider is None or current.credential_pool is not None:
+        return False
+    if (policy_model != result.new_model or current.model != result.new_model
+            or (configured_provider and current.provider != configured_provider)):
+        return False
+    if current.runtime_provider != (result.target_provider or ''):
+        return False
+    if launch_key is not None and not _same_reset_key(launch_key, result.api_key):
+        return False
+    if _reset_credential_signature(current_config, result.target_provider) != _reset_credential_signature(
+            target_config, result.target_provider):
+        return False
+    if callable(current.api_key) or callable(result.api_key):
+        return False
+    if (current.api_mode or '') != (result.api_mode or ''):
+        return False
+    from hermes_cli.route_identity import normalize_route_base_url
+    return normalize_route_base_url(current.base_url) == normalize_route_base_url(result.base_url)
+
+
+def _same_reset_key(left, right):
+    """Compare a private launch credential to the resolved profile credential without exposing it."""
+    return isinstance(left, str) and isinstance(right, str) and hmac.compare_digest(left, right)
+
+
+def _reset_credential_signature(config, provider):
+    """Credential source declared by the active route, without comparing resolved runtime tokens."""
+    fields = ('api_key', 'api', 'key_env', 'api_key_env', 'api_key_from')
+
+    def values(entry):
+        if not isinstance(entry, dict):
+            return ()
+        return tuple((field, entry.get(field)) for field in fields)
+
+    if not isinstance(config, dict):
+        return values(None), values(None), values(None)
+    model = config.get('model')
+    providers = config.get('providers')
+    provider_entry = providers.get(provider) if isinstance(providers, dict) else None
+    custom = config.get('custom_providers')
+    custom_entry = next((entry for entry in custom if isinstance(entry, dict)
+                         and _custom_provider_name(entry) == provider), None) if isinstance(custom, list) else None
+    return values(model), values(provider_entry), values(custom_entry)
 
 
 def _provider_resolution_config(authority, config, bypass=False):

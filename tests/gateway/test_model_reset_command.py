@@ -62,11 +62,11 @@ async def test_owner_reset_returns_a_local_session_to_the_configured_default_rea
     """The TUI, Desktop and the attached CLI send ``session.mutate model {model: 'reset'}`` to the owner."""
     from gateway.run_turn_prepare import GatewayTurnPrepareMixin
     from gateway.session_policy import policy_for_source
-    from hermes_constants import get_hermes_home
     from tests.gateway.test_follow_profile_followups import _profile
     from tests.gateway.test_session_follow_profile_config import _owner
     import gateway.run as gateway_run
 
+    from hermes_constants import get_hermes_home
     home = get_hermes_home()
     home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(gateway_run, "_hermes_home", home)
@@ -75,9 +75,10 @@ async def test_owner_reset_returns_a_local_session_to_the_configured_default_rea
     runner._peek_session_state = lambda key: None
     runner._resolve_session_agent_runtime = (
         lambda **kw: GatewayTurnPrepareMixin._resolve_session_agent_runtime(runner, **kw))
+    monkeypatch.setattr("tools.computer_use.cua_backend_driver.cua_driver_binary_available", lambda: False)
     try:
         created = await owner.dispatch({"id": "c", "method": "session.create", "params": dict(
-            request_id="c", source="tui", cwd=str(home), toolsets=[])})
+            request_id="c", source="tui", cwd=str(home), toolsets=[], follow_profile_config=True)})
         sid = created["result"]["session_id"]
         live = authority.sessions[sid]
 
@@ -96,8 +97,68 @@ async def test_owner_reset_returns_a_local_session_to_the_configured_default_rea
         assert policy_for_source(runner, live.source).model == "cfg-b"
         revision = authority.db.get_session(sid)["runtime_revision"]
         again = await pick("reset")
-        assert again["status"] == "noop" and "cfg-b" in again["note"]  # nothing to reset, nothing written
+        assert again.get("status") == "noop" and "cfg-b" in again.get("note", "")
         assert authority.db.get_session(sid)["runtime_revision"] == revision
+    finally:
+        await owner.close()
+        store.close_all_db_handles()
+
+
+@pytest.mark.parametrize(("override_url", "override_key"), [
+    ("http://127.0.0.1:2/v1", "override-test-key"),
+    ("http://127.0.0.1:1/v1", "override-test-key"),
+])
+@pytest.mark.asyncio
+async def test_owner_reset_restores_the_profile_route_when_model_and_provider_match(
+        override_url, override_key, monkeypatch):
+    """A session endpoint override is not a no-op just because its model and provider match config."""
+    from hermes_constants import get_hermes_home
+    home = get_hermes_home()
+    home.mkdir(parents=True, exist_ok=True)
+    from gateway.run_turn_prepare import GatewayTurnPrepareMixin
+    from tests.gateway.test_session_follow_profile_config import _owner
+    import gateway.run as gateway_run
+
+    configured_url, configured_key = "http://127.0.0.1:1/v1", "configured-test-key"
+    (home / "config.yaml").write_text(json.dumps({"model": {
+        "default": "same-model", "provider": "custom", "base_url": configured_url,
+        "api_key": configured_key, "api_mode": "chat_completions"}}))
+    monkeypatch.setattr(gateway_run, "_hermes_home", home)
+    store, runner, authority, owner = _owner(home)
+    from gateway.session_policy import profile_config
+    assert authority.db.db_path.resolve().parent == home.resolve()
+    assert profile_config(authority).get("model", {}).get("default") == "same-model"
+    runner._peek_session_state = lambda _key: None
+    runner._resolve_session_agent_runtime = (
+        lambda **kw: GatewayTurnPrepareMixin._resolve_session_agent_runtime(runner, **kw))
+    try:
+        created = await owner.dispatch({"id": "create", "method": "session.create", "params": dict(
+            request_id="create", source="tui", cwd=str(home), toolsets=[], follow_profile_config=True,
+            model="same-model",
+            provider="custom", base_url=override_url, api_key=override_key)})
+        assert "result" in created, created
+        sid = created["result"]["session_id"]
+        live = authority.sessions[sid]
+
+        model, runtime = GatewayTurnPrepareMixin._resolve_session_agent_runtime(runner, source=live.source)
+        assert model == "same-model"
+        assert runtime["base_url"].rstrip("/") == override_url
+        assert runtime["api_key"] == override_key
+        from gateway.session_policy import profile_config
+        assert authority.db.db_path.resolve().parent == home.resolve()
+        assert profile_config(authority).get("model", {}).get("default") == "same-model"
+
+        snapshot = authority.db.get_session(sid)
+        response = await owner.dispatch({"id": "reset", "method": "session.mutate", "params": dict(
+            session_id=sid, request_id="reset", operation="model", payload={"model": "reset"},
+            expected_revision=snapshot["runtime_revision"], expected_generation=snapshot["runtime_generation"])})
+        assert "result" in response, response
+        assert response["result"].get("status") != "noop"
+
+        model, runtime = GatewayTurnPrepareMixin._resolve_session_agent_runtime(runner, source=live.source)
+        assert model == "same-model"
+        assert runtime["base_url"].rstrip("/") == configured_url
+        assert runtime["api_key"] == configured_key
     finally:
         await owner.close()
         store.close_all_db_handles()

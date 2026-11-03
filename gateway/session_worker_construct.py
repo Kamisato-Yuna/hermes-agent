@@ -164,6 +164,11 @@ def route_runtime(policy, frozen, model, key, *, fallback=True):
         from hermes_cli.route_identity import normalize_route_base_url
         if normalize_route_base_url(launch_url) != normalize_route_base_url((frozen.get('model') or {}).get('base_url')):
             launch_url = None
+        elif provider == 'custom' and not key and (frozen.get('model') or {}).get('api_key'):
+            # A followed profile can return to the launch endpoint with its own inline key. Resolve
+            # that profile route normally; the direct-alias path treats a missing launch key as
+            # unauthenticated and would otherwise discard the configured model.api_key.
+            launch_url = None
     # Every rung reads the session's FROZEN config, never live config.yaml: a later
     # ``model.base_url`` edit must not carry this route's frozen credential to the new host
     # (R2-M2). The auth-store pool is not config, so refresh/rotation still applies.
