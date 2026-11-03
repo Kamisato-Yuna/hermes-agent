@@ -275,7 +275,7 @@ def test_local_mlx_worker_start_prewarm_and_cleans_temporary_audio(monkeypatch, 
     monkeypatch.setattr(
         transcription_mlx,
         "check_local_mlx_requirements",
-        lambda cfg: {"ready": True, "model": "test-model"},
+        lambda cfg: {"ready": True, "python": sys.executable, "model": "test-model"},
     )
     captured = {}
 
