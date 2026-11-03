@@ -8,6 +8,7 @@ never imports ``cli`` at module load time (import cycle).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import tempfile
@@ -17,6 +18,8 @@ import time
 from agent.i18n import t
 from hermes_constants import is_termux as _is_termux_environment
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 def _config_section(name: str) -> dict:
@@ -197,7 +200,7 @@ class CLIVoiceMixin:
 
     def _voice_stop_and_transcribe(self):
         """Stop recording, transcribe via STT, and queue the transcript as input."""
-        from cli import _DIM, _RST, _VoiceInputMessage, _cprint, logger
+        from cli import _DIM, _RST, _VoiceInputMessage, _cprint
         # Atomic guard; _voice_processing is set immediately so concurrent Ctrl+B presses
         # don't race into the START path while recorder.stop() holds its lock.
         with self._voice_lock:
@@ -268,6 +271,7 @@ class CLIVoiceMixin:
                     _cprint(f"\n{_DIM}{t('cli.voice.transcription_failed', error=result.get('error') or t('cli.shared.unknown_error'))}{_RST}")
                     transcription_failed = True
         except Exception as e:
+            logger.exception("Voice input processing failed")
             _cprint(f"\n{_DIM}{t('cli.voice.processing_error', error=e)}{_RST}")
             transcription_failed = wav_path is not None
         finally:
@@ -472,7 +476,7 @@ class CLIVoiceMixin:
 
     def _voice_submit_barge_utterance(self, wav_path: str) -> None:
         """Transcribe a barge-captured interruption and queue it as the next turn."""
-        from cli import _DIM, _RST, _VoiceInputMessage, _cprint, logger
+        from cli import _DIM, _RST, _VoiceInputMessage, _cprint
         submitted = False
         try:
             from tools.voice_mode import transcribe_recording
@@ -514,6 +518,7 @@ class CLIVoiceMixin:
             elif not result.get("success"):
                 _cprint(f"\n{_DIM}{t('cli.voice.transcription_failed', error=result.get('error') or t('cli.shared.unknown_error'))}{_RST}")
         except Exception as e:
+            logger.exception("Voice barge-in processing failed")
             _cprint(f"\n{_DIM}{t('cli.voice.processing_error', error=e)}{_RST}")
         finally:
             _unlink_quietly(wav_path)
@@ -569,6 +574,7 @@ class CLIVoiceMixin:
                 from tools.transcription_tools import start_local_mlx_worker
                 mlx_worker, worker_status = start_local_mlx_worker(stt_cfg, prewarm=prewarm)
             except Exception as exc:
+                logger.exception("MLX worker startup failed; using one-shot fallback")
                 mlx_worker = None
                 worker_status = {"success": False, "error": f"MLX worker start failed: {exc}"}
             if worker_status.get("success"):
@@ -640,7 +646,7 @@ class CLIVoiceMixin:
 
     def _disable_voice_mode(self):
         """Disable voice mode, cancel active STT, stop the MLX worker and stop TTS."""
-        from cli import _DIM, _RST, _cprint, logger
+        from cli import _DIM, _RST, _cprint
         mlx_worker = None
         with self._voice_lock:
             stt_cancel = getattr(self, "_voice_stt_cancel", None)
@@ -683,9 +689,50 @@ class CLIVoiceMixin:
             from tools.voice_mode import stop_playback
             stop_playback()
         except Exception:
-            pass
+            logger.exception("Voice playback shutdown failed")
         self._voice_tts_done.set()
         _cprint(f"\n{_DIM}{t('cli.voice.disabled')}{_RST}")
+
+    def _handle_voice_command(self, command: str):
+        """Handle /voice [on|off|tts|status|devices] command."""
+        from hermes_cli.cli_commands_session_tools import _command_arg, _cp, _t
+
+        subcommand = _command_arg(command, lower=True) or ("off" if self._voice_mode else "on")
+        if subcommand in {"devices", "device"}:
+            try:
+                from tools.voice_mode import list_audio_input_devices
+
+                devices = list_audio_input_devices()
+            except Exception as exc:
+                logger.exception("Could not list voice input devices")
+                _cp(f"Unable to list input devices: {exc}")
+                return
+            if not devices:
+                _cp("No input-capable audio devices found.")
+                return
+            _cp("Available voice input devices:")
+            for device in devices:
+                rate = device.get("default_samplerate")
+                rate_text = f", {int(rate)} Hz" if isinstance(rate, (int, float)) and rate > 0 else ""
+                _cp(
+                    f"  [{device['index']}] {device['name']} "
+                    f"({device['max_input_channels']} input channel(s){rate_text})"
+                )
+            _cp("Set one with voice.input_device in config.yaml.")
+            return
+        actions = {
+            "on": self._enable_voice_mode,
+            "off": self._disable_voice_mode,
+            "tts": self._toggle_voice_tts,
+            "status": self._show_voice_status,
+        }
+        if subcommand in actions:
+            actions[subcommand]()
+            return
+        _cp(
+            _t("voice.unknown_subcommand", subcommand=subcommand),
+            f"{_t('voice.usage')} | /voice devices",
+        )
 
     def _maybe_start_wake_word(self):
         """Start the wake-word listener at CLI startup if this surface is eligible."""

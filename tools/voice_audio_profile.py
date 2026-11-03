@@ -23,19 +23,20 @@ logger = logging.getLogger(__name__)
 _DEFAULT_TIMEOUT_SECONDS = 15.0
 
 
-def _analysis_config(stt_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _analysis_config(stt_config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     if stt_config is None:
         try:
             from hermes_cli.config import load_config
             stt_config = load_config()
         except Exception:
+            logger.debug("Could not load voice analysis config", exc_info=True)
             stt_config = {}
     voice = stt_config.get("voice") if isinstance(stt_config, dict) else {}
     analysis = voice.get("analysis") if isinstance(voice, dict) else {}
     return analysis if isinstance(analysis, dict) else {}
 
 
-def _enabled(config: Dict[str, Any]) -> bool:
+def _enabled(config: dict[str, Any]) -> bool:
     return config.get("enabled") is True and bool(config.get("command"))
 
 
@@ -65,7 +66,7 @@ def _finite_numbers(values: Any) -> list[float]:
     return result
 
 
-def summarize_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
+def summarize_profile(profile: dict[str, Any]) -> dict[str, Any]:
     """Keep only compact, non-sensitive audio observations for prompt context."""
     analysis = profile.get("analysis") if isinstance(profile, dict) else {}
     if not isinstance(analysis, dict):
@@ -89,7 +90,7 @@ def summarize_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
             rms.extend(_finite_numbers([item.get("rms")]))
             zcr.extend(_finite_numbers([item.get("zero_crossing_rate")]))
 
-    acoustic: Dict[str, Any] = {"window_seconds": analysis.get("window_seconds")}
+    acoustic: dict[str, Any] = {"window_seconds": analysis.get("window_seconds")}
     if pitches:
         acoustic["pitch_hz_median"] = round(median(pitches), 2)
     if rms:
@@ -97,7 +98,7 @@ def summarize_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
     if zcr:
         acoustic["zero_crossing_rate_mean"] = round(sum(zcr) / len(zcr), 6)
 
-    result: Dict[str, Any] = {
+    result: dict[str, Any] = {
         "emotion_tendency": top_emotions,
         "acoustic": acoustic,
     }
@@ -110,8 +111,8 @@ def summarize_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
 def analyze_recording(
     audio_path: str | Path,
     *,
-    stt_config: Optional[Dict[str, Any]] = None,
-) -> Optional[Dict[str, Any]]:
+    stt_config: Optional[dict[str, Any]] = None,
+) -> Optional[dict[str, Any]]:
     """Run the configured analyzer, returning a compact profile or ``None``."""
     config = _analysis_config(stt_config)
     if not _enabled(config):
@@ -147,7 +148,7 @@ def analyze_recording(
             if not output.is_file():
                 logger.warning("Voice analysis produced no profile: %s", output)
                 return None
-            profile = json.loads(output.read_text(encoding="utf-8"))
+            profile = json.loads(output.read_text(encoding="utf-8-sig"))
             if not isinstance(profile, dict):
                 logger.warning("Voice analysis profile is not a JSON object")
                 return None

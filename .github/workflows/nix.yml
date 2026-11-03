@@ -13,7 +13,7 @@ name: Nix flake check
 on:
   pull_request:
   push:
-    branches: [main, firefly-main]
+    branches: [main]
   workflow_call:
     inputs:
       commit:

@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from typing import Any, Dict
+
+logger = logging.getLogger(__name__)
 
 try:
     from .mlx_whisper_runner import (
@@ -29,11 +32,11 @@ except ImportError:  # pragma: no cover - used when executed as an external scri
     )
 
 
-def _json_line(payload: Dict[str, Any]) -> None:
+def _json_line(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), flush=True)
 
 
-def _number(request: Dict[str, Any], key: str, default: float) -> float:
+def _number(request: dict[str, Any], key: str, default: float) -> float:
     value = request.get(key, default)
     try:
         return float(value)
@@ -41,7 +44,7 @@ def _number(request: Dict[str, Any], key: str, default: float) -> float:
         return default
 
 
-def _transcribe_request(mlx: Any, request: Dict[str, Any], model: str, *, prewarm: bool = False) -> Dict[str, Any]:
+def _transcribe_request(mlx: Any, request: dict[str, Any], model: str, *, prewarm: bool = False) -> dict[str, Any]:
     audio = request.get("audio")
     if not isinstance(audio, str) or not audio:
         return {"success": False, "error_type": "configuration", "error": "audio is required"}
@@ -80,7 +83,7 @@ def _transcribe_request(mlx: Any, request: Dict[str, Any], model: str, *, prewar
             result["prewarm"] = True
         return result
 
-    kwargs: Dict[str, Any] = {
+    kwargs: dict[str, Any] = {
         "path_or_hf_repo": model,
         "language": "zh",
         "task": "transcribe",
@@ -109,7 +112,7 @@ def _transcribe_request(mlx: Any, request: Dict[str, Any], model: str, *, prewar
     transcript = " ".join(kept).strip()
     if not segments and isinstance(result.get("text"), str):
         transcript = result["text"].strip()
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "success": True,
         "text": transcript,
         "transcript": transcript,
@@ -134,7 +137,8 @@ def main() -> int:
 
     try:
         import mlx_whisper
-    except Exception as exc:  # noqa: BLE001 - protocol must report startup failure
+    except Exception as exc:
+        logger.exception("MLX worker import failed")
         print(f"MLX worker import failed: {exc}", file=sys.stderr, flush=True)
         _json_line({"event": "ready", "success": False, "error_type": "runtime", "error": str(exc)})
         return 1
@@ -164,7 +168,8 @@ def main() -> int:
             )
             response["id"] = request_id
             _json_line(response)
-        except Exception as exc:  # noqa: BLE001 - keep the worker alive for later requests
+        except Exception as exc:
+            logger.exception("MLX worker request failed")
             print(f"MLX worker request failed: {exc}", file=sys.stderr, flush=True)
             _json_line({
                 "id": request_id,

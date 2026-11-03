@@ -338,7 +338,7 @@ def test_running_revision_is_not_applied_to_an_explicit_target(installation, mon
     assert check_for_updates(install_root=linked, home=home)["currentSha"] == head
     # Default invocation retains the Nix revision probe even without a Git checkout.
     monkeypatch.setattr("hermes_cli.config.get_project_root", lambda: home)
-    responses["/repos/Kamisato-Yuna/hermes-agent/commits/firefly-main"] = (200, "e" * 40)
+    responses["/repos/Kamisato-Yuna/hermes-agent/commits/main"] = (200, "e" * 40)
     assert check_for_updates(home=home)["behind"] == 0
 
 
@@ -478,7 +478,7 @@ def test_embedded_revision_keeps_https_ref_advertisement_recovery(installation, 
     def advertise(args, **kwargs):
         if "ls-remote" in args:
             probes.append((args, kwargs))
-            return subprocess.CompletedProcess(args, 0, head + "\trefs/heads/firefly-main\n", "")
+            return subprocess.CompletedProcess(args, 0, head + "\trefs/heads/main\n", "")
         return original(args, **kwargs)
 
     monkeypatch.setattr(subprocess, "run", advertise)

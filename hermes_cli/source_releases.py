@@ -18,7 +18,7 @@ OFFICIAL_REPOSITORY = "NousResearch/hermes-agent"
 # This fork's user-facing update source; keep distinct from the upstream repository
 # used by upstream-only metadata and legacy compatibility checks.
 DEFAULT_UPDATE_REPOSITORY = "Kamisato-Yuna/hermes-agent"
-DEFAULT_UPDATE_BRANCH = "firefly-main"
+DEFAULT_UPDATE_BRANCH = "main"
 _GITHUB_ORIGIN = re.compile(
     r"^(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)"
     r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$", re.IGNORECASE,
@@ -153,7 +153,7 @@ def _resolve_source_target(channel: str, git_cmd=None, cwd=None, *, repository=N
     if channel == "stable":
         return _resolve_stable(repository, git_cmd, cwd)
     if channel == "main":
-        # This fork's main channel follows firefly-main; upstream-compatible installs
+        # This fork's main channel follows main; upstream-compatible installs
         # retain their main branch. No R2 record is read for either source branch.
         branch = DEFAULT_UPDATE_BRANCH if repository.lower() == DEFAULT_UPDATE_REPOSITORY.lower() else "main"
         return SourceTarget(channel, channel, repository, branch=branch)

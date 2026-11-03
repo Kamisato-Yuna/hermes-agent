@@ -40,7 +40,7 @@ on:
         default: false
   pull_request:
   push:
-    branches: [firefly-main]
+    branches: [main]
 
 permissions:
   contents: read

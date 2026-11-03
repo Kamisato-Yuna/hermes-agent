@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 import asyncio
 from collections import deque
 import hmac
+import json
 import logging
 import os
 import re
@@ -902,7 +903,7 @@ def _hermes_one_normalize_model_row(row, index=0):
 def _hermes_one_read_model_library():
     path = _hermes_one_model_library_path()
     try:
-        raw = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+        raw = json.loads(path.read_text(encoding="utf-8-sig")) if path.exists() else []
     except Exception:
         raw = []
     rows = []

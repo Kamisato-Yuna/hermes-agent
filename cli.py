@@ -817,7 +817,7 @@ class _VoiceInputMessage:
     (#65827).
     """
 
-    __slots__ = ("text", "audio_profile")
+    __slots__ = ("audio_profile", "text")
 
     def __init__(self, text: str, audio_profile: Optional[dict] = None):
         self.text = text

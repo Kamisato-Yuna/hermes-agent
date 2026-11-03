@@ -66,8 +66,8 @@ class SpokenScriptResult:
     spoken_text: str
     rewrite_used: bool = False
     fallback_used: bool = False
-    validation_errors: List[str] = field(default_factory=list)
-    events: List[Dict[str, Any]] = field(default_factory=list)
+    validation_errors: list[str] = field(default_factory=list)
+    events: list[dict[str, Any]] = field(default_factory=list)
     provider: str = ""
     model: str = ""
     rewrite_ms: int = 0
@@ -86,7 +86,7 @@ def _section_to_chinese(value: int) -> str:
     if value == 0:
         return "零"
     digits = str(value)
-    result: List[str] = []
+    result: list[str] = []
     zero_pending = False
     for index, digit in enumerate(digits):
         number = int(digit)
@@ -111,13 +111,13 @@ def _integer_to_chinese(value: int) -> str:
     if value < 0:
         return "负" + _integer_to_chinese(-value)
 
-    sections: List[int] = []
+    sections: list[int] = []
     remaining = value
     while remaining:
         sections.append(remaining % 10000)
         remaining //= 10000
 
-    result: List[str] = []
+    result: list[str] = []
     zero_between_sections = False
     for index in range(len(sections) - 1, -1, -1):
         section = sections[index]
@@ -283,14 +283,14 @@ def validate_spoken_text(
     text: str,
     max_chars: int = _DEFAULT_MAX_CHARS,
     allowed_latin_terms: Sequence[str] = (),
-) -> List[str]:
+) -> list[str]:
     """Return safety-gate errors; an empty list means the script is safe.
 
     allowed_latin_terms: English proper nouns permitted to survive verbatim
     (read in English). Their letters are masked before the latin_text and
     unsupported_character checks; any other Latin still trips the gate.
     """
-    errors: List[str] = []
+    errors: list[str] = []
     value = str(text or "").strip()
     if not value:
         return ["empty"]
@@ -322,7 +322,7 @@ def validate_spoken_text(
     return list(dict.fromkeys(errors))
 
 
-def _load_settings(config: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+def _load_settings(config: Optional[Mapping[str, Any]]) -> dict[str, Any]:
     if config is not None:
         return dict(config)
     try:
@@ -340,8 +340,8 @@ def spoken_rewrite_enabled(config: Optional[Mapping[str, Any]] = None) -> bool:
     return is_truthy_value(_load_settings(config).get("enabled", False), default=False)
 
 
-def _main_route_from_runtime() -> Dict[str, Any]:
-    route: Dict[str, Any] = {}
+def _main_route_from_runtime() -> dict[str, Any]:
+    route: dict[str, Any] = {}
     try:
         from agent import auxiliary_client as aux
 
@@ -377,7 +377,7 @@ def _response_content(response: Any) -> str:
     if isinstance(content, str):
         return content.strip()
     if isinstance(content, list):
-        parts: List[str] = []
+        parts: list[str] = []
         for item in content:
             if isinstance(item, Mapping):
                 value = item.get("text") or item.get("content")
@@ -405,7 +405,7 @@ def _parse_rewrite_response(response: Any) -> str:
 
 def _rewrite_messages(
     reply: str, max_chars: int, preserve_terms: Sequence[str] = ()
-) -> List[Dict[str, str]]:
+) -> list[dict[str, str]]:
     system = (
         "你负责生成安全的中文语音播报稿。先理解完整的助手回复，再只保留结论、重要限制和下一步。"
         "只返回一个严格 JSON 对象，格式必须是 {\"spoken_text\":\"...\"}，不要 Markdown、解释、代码块或其他字段。"
@@ -434,7 +434,7 @@ def _rewrite_messages(
 
 
 def _record_event(
-    events: List[Dict[str, Any]],
+    events: list[dict[str, Any]],
     request_id: str,
     stage: str,
     started: float,
@@ -446,7 +446,7 @@ def _record_event(
     provider: str = "",
     model: str = "",
 ) -> None:
-    event: Dict[str, Any] = {
+    event: dict[str, Any] = {
         "request_id": request_id,
         "stage": stage,
         "status": status,
@@ -493,7 +493,7 @@ def prepare_spoken_script(
     started = time.monotonic()
     reply = str(text or "")
     settings = _load_settings(config)
-    events: List[Dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
     input_hash = hashlib.sha256(reply.encode("utf-8", "replace")).hexdigest()[:16]
     _record_event(
         events,
@@ -575,7 +575,7 @@ def prepare_spoken_script(
     if bool(settings.get("fallback_to_main", True)) and _route_value(main, "model"):
         attempts.append((main, True, ""))
 
-    last_errors: List[str] = []
+    last_errors: list[str] = []
     for route, is_fallback, route_task in attempts:
         provider = _route_value(route, "provider")
         model = _route_value(route, "model")

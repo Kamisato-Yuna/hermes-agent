@@ -278,7 +278,7 @@ def _github_compare_behind(current_rev: str, target_rev: str) -> Optional[int]:
 
 
 def upstream_commits_behind(n: int = 20) -> list[dict[str, Any]]:
-    """Commits between the last checked HEAD and firefly-main tip, newest first; [] when unknown.
+    """Commits between the last checked HEAD and main tip, newest first; [] when unknown.
 
     Reads the tips recorded by ``check_for_updates`` so it costs no extra request when the
     compare payload is already memoized for this process.
@@ -341,7 +341,7 @@ def _github_branch_tip(repo_slug: str, branch: str) -> Optional[str]:
 
 
 def _upstream_main_sha() -> Optional[str]:
-    """Tip SHA of the fork's firefly-main update branch; API first, HTTPS ls-remote fallback."""
+    """Tip SHA of the fork's main update branch; API first, HTTPS ls-remote fallback."""
     sha = _github_branch_tip(
         source_check.DEFAULT_UPDATE_REPOSITORY, source_check.DEFAULT_UPDATE_BRANCH)
     if sha:
@@ -356,14 +356,14 @@ def _upstream_main_sha() -> Optional[str]:
 
 
 def _check_via_rev(local_rev: str) -> Optional[int]:
-    """Compare an embedded git revision to the firefly-main update tip via GitHub API."""
+    """Compare an embedded git revision to the main update tip via GitHub API."""
     global _last_target_rev
     _last_target_rev = _upstream_main_sha()
     return _tips_behind(local_rev, _last_target_rev)
 
 
 def _check_via_local_git(repo_dir: Path) -> Optional[int]:
-    """Count commits behind origin/firefly-main in a local checkout.
+    """Count commits behind origin/main in a local checkout.
 
     Passive checks never run ``git fetch``: every CLI/TUI/gateway start used to negotiate a pack
     with GitHub, and across the install base that was tens of millions of fetch requests a day
@@ -382,27 +382,27 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     if canonical.startswith("github.com/"):
         target_rev = _github_branch_tip(canonical.removeprefix("github.com/"), branch)
     else:
-        # Non-GitHub origin: one ls-remote for the firefly-main tip (ref advertisement only, no pack transfer).
+        # Non-GitHub origin: one ls-remote for the main tip (ref advertisement only, no pack transfer).
         result = _git_run(["ls-remote", "origin", f"refs/heads/{branch}"], cwd=repo_dir, timeout=10, network=True)
         target_rev = result.stdout.split()[0] if result is not None and result.returncode == 0 and result.stdout else None
     global _last_target_rev
     _last_target_rev = target_rev
-    # Tip SHAs alone can't distinguish "behind" from a local commit AHEAD of origin/firefly-main, and
+    # Tip SHAs alone can't distinguish "behind" from a local commit AHEAD of origin/main, and
     # misreporting an ahead checkout nudges the user into `hermes update`, which can wipe carried
-    # work — hence the ancestor check inside _tips_behind, against the FRESH firefly-main SHA.
+    # work — hence the ancestor check inside _tips_behind, against the FRESH main SHA.
     return _tips_behind(head_rev, target_rev, repo_dir)
 
 
 def _read_json(path: Path) -> Optional[dict]:
     """Parse ``path`` as a JSON object; None when missing, unreadable, or not a dict."""
-    blob = _quiet(lambda: json.loads(path.read_text(encoding="utf-8")))
+    blob = _quiet(lambda: json.loads(path.read_text(encoding="utf-8-sig")))
     return blob if isinstance(blob, dict) else None
 
 
 def check_for_updates(*, passive: bool = False) -> Optional[int]:
     """Check whether a Hermes update is available.
 
-    If ``HERMES_REVISION`` is set, compare it to the fork's firefly-main tip; otherwise
+    If ``HERMES_REVISION`` is set, compare it to the fork's main tip; otherwise
     compare the local checkout's HEAD with the same update target. Both paths use the GitHub API,
     never ``git fetch``.
     """
@@ -489,7 +489,7 @@ def _compute_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]
     upstream, local = (source_check._git_stdout(["rev-parse", "--short=8", rev], cwd=repo_dir)
                        for rev in (f"origin/{source_check.DEFAULT_UPDATE_BRANCH}", "HEAD"))
     if not upstream or not local:
-        # Live-git lookup failed (e.g. shallow clone without origin/firefly-main).
+        # Live-git lookup failed (e.g. shallow clone without origin/main).
         return _baked_banner_state()
     base = f"origin/{source_check.DEFAULT_UPDATE_BRANCH}"
     ahead = source_check._git_count(["rev-list", "--count", f"{base}..HEAD"], cwd=repo_dir) or 0
@@ -546,8 +546,8 @@ def format_banner_version_label() -> str:
     upstream, local = state["upstream"], state["local"]
     ahead = int(state.get("ahead") or 0)
     if ahead <= 0 or upstream == local:
-        return f"{base} · firefly-main {upstream}"
-    return f"{base} · firefly-main {upstream} · local {local} (+{ahead} carried {_plural(ahead, 'commit')})"
+        return f"{base} · main {upstream}"
+    return f"{base} · main {upstream} · local {local} (+{ahead} carried {_plural(ahead, 'commit')})"
 
 
 # === Non-blocking update check ===

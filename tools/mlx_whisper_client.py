@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
-import signal
 import subprocess
 import threading
 import time
 import uuid
 from pathlib import Path
+from types import TracebackType
 from typing import Any, Dict, Optional
 
 from hermes_cli._subprocess_compat import windows_hide_flags
+
+logger = logging.getLogger(__name__)
 
 
 class MLXWhisperWorkerError(RuntimeError):
@@ -27,7 +30,7 @@ class MLXWhisperWorker:
         python_path: str,
         model: str,
         runner_path: str,
-        mlx_config: Optional[Dict[str, Any]] = None,
+        mlx_config: Optional[dict[str, Any]] = None,
         timeout_seconds: float = 300.0,
     ) -> None:
         self.python_path = python_path
@@ -36,7 +39,7 @@ class MLXWhisperWorker:
         self.mlx_config = dict(mlx_config or {})
         self.timeout_seconds = max(1.0, float(timeout_seconds))
         self._process: Optional[subprocess.Popen] = None
-        self._messages: "queue.Queue[Dict[str, Any]]" = queue.Queue()
+        self._messages: queue.Queue[dict[str, Any]] = queue.Queue()
         self._request_lock = threading.Lock()
         self._lifecycle_lock = threading.Lock()
         self._reader_threads: list[threading.Thread] = []
@@ -62,13 +65,10 @@ class MLXWhisperWorker:
     def stderr_tail(self) -> str:
         return "\n".join(self._stderr_lines[-20:])
 
-    def _child_env(self) -> Dict[str, str]:
-        try:
-            from tools.environments.local import hermes_subprocess_env
+    def _child_env(self) -> dict[str, str]:
+        from tools.environments.local import served_profile_child_env
 
-            env = hermes_subprocess_env(inherit_credentials=False)
-        except Exception:
-            env = dict(os.environ)
+        env = served_profile_child_env(inherit_credentials=False)
         for config_key, env_key in (
             ("hf_home", "HF_HOME"),
             ("hf_endpoint", "HF_ENDPOINT"),
@@ -110,7 +110,7 @@ class MLXWhisperWorker:
                         "error_type": "protocol",
                         "error": f"worker emitted invalid JSON: {exc}",
                     })
-        except Exception as exc:  # noqa: BLE001 - reader must not kill the parent
+        except (OSError, ValueError) as exc:
             self._messages.put({
                 "success": False,
                 "error_type": "worker_transport",
@@ -124,34 +124,36 @@ class MLXWhisperWorker:
                 if line:
                     self._stderr_lines.append(line)
                     del self._stderr_lines[:-100]
-        except Exception:
-            pass
+        except (OSError, ValueError):
+            return
 
     def _terminate_process(self, process: Any) -> None:
         try:
-            if process.poll() is not None:
-                return
+            running = process.poll() is None
         except AttributeError:
-            if getattr(process, "returncode", None) is not None:
+            running = getattr(process, "returncode", None) is None
+        pid = getattr(process, "pid", None)
+        if os.name == "posix" and isinstance(pid, int):
+            from hermes_cli.process_identity import stop_owned_group_survivors
+
+            if stop_owned_group_survivors(pid, proc=process, grace=1.0) or not running:
                 return
-        if os.name != "nt":
-            try:
-                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-            except (AttributeError, OSError):
-                pass
+        if not running:
+            return
         try:
             process.terminate()
-        except Exception:
-            pass
+        except (AttributeError, OSError):
+            return
         try:
             process.wait(timeout=2)
-        except Exception:
+        except subprocess.TimeoutExpired:
             try:
                 process.kill()
-            except Exception:
-                pass
+            except (AttributeError, OSError):
+                return
+            process.wait()
 
-    def start(self) -> "MLXWhisperWorker":
+    def start(self) -> MLXWhisperWorker:
         # A crashed process can leave its last response in the queue. Reap
         # that generation before spawning the replacement so a stale response
         # cannot satisfy a request from the new generation.
@@ -167,8 +169,11 @@ class MLXWhisperWorker:
             if not Path(self.runner_path).is_file():
                 raise MLXWhisperWorkerError(f"MLX worker script is missing: {self.runner_path}")
             try:
-                process = subprocess.Popen(
+                from hermes_cli.process_identity import spawn_owned
+
+                process = spawn_owned(
                     self._command(),
+                    purpose="mlx-whisper-worker",
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -177,7 +182,6 @@ class MLXWhisperWorker:
                     errors="replace",
                     env=self._child_env(),
                     creationflags=windows_hide_flags(),
-                    **({"start_new_session": True} if os.name != "nt" else {}),
                 )
             except OSError as exc:
                 raise MLXWhisperWorkerError(f"MLX worker failed to start: {exc}") from exc
@@ -187,20 +191,24 @@ class MLXWhisperWorker:
             self._messages = queue.Queue()
             self._reader_threads = []
             if process.stdout is not None:
-                thread = threading.Thread(
-                    target=self._read_stdout,
-                    args=(process.stdout,),
+                from agent.memory_provider import spawn_context_thread
+
+                thread = spawn_context_thread(
+                    self._read_stdout,
                     name="hermes-mlx-worker-stdout",
                     daemon=True,
+                    args=(process.stdout,),
                 )
                 thread.start()
                 self._reader_threads.append(thread)
             if process.stderr is not None:
-                thread = threading.Thread(
-                    target=self._read_stderr,
-                    args=(process.stderr,),
+                from agent.memory_provider import spawn_context_thread
+
+                thread = spawn_context_thread(
+                    self._read_stderr,
                     name="hermes-mlx-worker-stderr",
                     daemon=True,
+                    args=(process.stderr,),
                 )
                 thread.start()
                 self._reader_threads.append(thread)
@@ -221,7 +229,7 @@ class MLXWhisperWorker:
         expected_event: Optional[str] = None,
         timeout: Optional[float] = None,
         cancel_event: Optional[threading.Event] = None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         deadline = time.monotonic() + (self.timeout_seconds if timeout is None else timeout)
         while True:
             if cancel_event is not None and cancel_event.is_set():
@@ -262,10 +270,10 @@ class MLXWhisperWorker:
 
     def _send(
         self,
-        payload: Dict[str, Any],
+        payload: dict[str, Any],
         *,
         cancel_event: Optional[threading.Event] = None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         process = self._process
         if not self._started or process is None or not self.is_running or process.stdin is None:
             raise MLXWhisperWorkerError("MLX worker is not running")
@@ -286,11 +294,11 @@ class MLXWhisperWorker:
         audio_path: str,
         operation: str = "transcribe",
         cancel_event: Optional[threading.Event] = None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         if not self.is_running:
             self.start()
         request_id = uuid.uuid4().hex
-        payload: Dict[str, Any] = {
+        payload: dict[str, Any] = {
             "id": request_id,
             "op": operation,
             "audio": audio_path,
@@ -315,7 +323,7 @@ class MLXWhisperWorker:
                 self.stop()
                 raise
 
-    def warmup(self, audio_path: str) -> Dict[str, Any]:
+    def warmup(self, audio_path: str) -> dict[str, Any]:
         return self.request(audio_path=audio_path, operation="warmup")
 
     def transcribe(
@@ -323,7 +331,7 @@ class MLXWhisperWorker:
         audio_path: str,
         *,
         cancel_event: Optional[threading.Event] = None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         return self.request(audio_path=audio_path, cancel_event=cancel_event)
 
     def stop(self) -> None:
@@ -336,8 +344,8 @@ class MLXWhisperWorker:
         try:
             if process.stdin is not None:
                 process.stdin.close()
-        except Exception:
-            pass
+        except (OSError, ValueError):
+            logger.debug("MLX worker stdin was already closed", exc_info=True)
         self._terminate_process(process)
         for thread in self._reader_threads:
             thread.join(timeout=0.5)
@@ -345,8 +353,13 @@ class MLXWhisperWorker:
 
     close = stop
 
-    def __enter__(self) -> "MLXWhisperWorker":
+    def __enter__(self) -> MLXWhisperWorker:
         return self.start()
 
-    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         self.stop()

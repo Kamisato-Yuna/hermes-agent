@@ -1,17 +1,17 @@
-"""The fork's default update notice must describe the target `firefly-main`."""
+"""The fork's default update notice must describe the target `main`."""
 
 from pathlib import Path
 
 import pytest
 
 
-def test_main_channel_targets_firefly_main_on_the_fork():
+def test_main_channel_targets_main_on_the_fork():
     from hermes_cli.source_releases import resolve_source_target
 
     target = resolve_source_target("main", repository="Kamisato-Yuna/hermes-agent")
 
     assert target.repository == "Kamisato-Yuna/hermes-agent"
-    assert target.branch == "firefly-main"
+    assert target.branch == "main"
 
 
 def test_default_update_source_matches_update_command_target():
@@ -20,12 +20,12 @@ def test_default_update_source_matches_update_command_target():
     from hermes_cli.main_install_repair import _resolve_update_branch
     from hermes_cli.source_releases import DEFAULT_UPDATE_BRANCH
 
-    assert DEFAULT_UPDATE_BRANCH == "firefly-main"
+    assert DEFAULT_UPDATE_BRANCH == "main"
     assert _resolve_update_branch(SimpleNamespace(branch=None)) == DEFAULT_UPDATE_BRANCH
 
 
 @pytest.mark.parametrize("current_branch", ["main", "HEAD", None])
-def test_passive_update_check_uses_firefly_main_not_checkout_branch(
+def test_passive_update_check_uses_fork_main_not_checkout_branch(
     tmp_path, monkeypatch, current_branch
 ):
     from hermes_cli import config, source_check, steward, update_channel
@@ -72,14 +72,14 @@ def test_passive_update_check_uses_firefly_main_not_checkout_branch(
     monkeypatch.setattr(source_check, "_github_compare", compare)
     status = source_check.check_for_updates(install_root=root, home=home, force=True)
 
-    assert seen == [("Kamisato-Yuna/hermes-agent", "firefly-main")]
+    assert seen == [("Kamisato-Yuna/hermes-agent", "main")]
     assert compares == [(head, target, "Kamisato-Yuna/hermes-agent")]
-    assert status["branch"] == "firefly-main"
+    assert status["branch"] == "main"
     assert status["targetSha"] == target
     assert status["behind"] == 3
 
 
-def test_startup_banner_reads_firefly_main_not_origin_main(monkeypatch, tmp_path):
+def test_startup_banner_reads_origin_main(monkeypatch, tmp_path):
     from hermes_cli import banner
 
     revisions = []
@@ -87,7 +87,7 @@ def test_startup_banner_reads_firefly_main_not_origin_main(monkeypatch, tmp_path
 
     def git_stdout(args, *, cwd, timeout=5):
         revisions.append(args[-1])
-        return "firefly01" if args[-1] == "origin/firefly-main" else "local001"
+        return "remote01" if args[-1] == "origin/main" else "local001"
 
     def git_count(args, *, cwd):
         counts.append(args[-1])
@@ -98,12 +98,12 @@ def test_startup_banner_reads_firefly_main_not_origin_main(monkeypatch, tmp_path
 
     state = banner._compute_git_banner_state(tmp_path)
 
-    assert revisions == ["origin/firefly-main", "HEAD"]
-    assert counts == ["origin/firefly-main..HEAD"]
-    assert state == {"upstream": "firefly01", "local": "local001", "ahead": 2}
+    assert revisions == ["origin/main", "HEAD"]
+    assert counts == ["origin/main..HEAD"]
+    assert state == {"upstream": "remote01", "local": "local001", "ahead": 2}
 
 
-def test_embedded_update_probe_uses_firefly_main(monkeypatch):
+def test_embedded_update_probe_uses_fork_main(monkeypatch):
     from hermes_cli import banner
 
     seen = []
@@ -116,7 +116,7 @@ def test_embedded_update_probe_uses_firefly_main(monkeypatch):
     monkeypatch.setattr(banner, "_github_branch_tip", branch_tip)
 
     assert banner._upstream_main_sha() == tip
-    assert seen == [("Kamisato-Yuna/hermes-agent", "firefly-main")]
+    assert seen == [("Kamisato-Yuna/hermes-agent", "main")]
 
 
 def test_update_count_compare_uses_fork_repository(monkeypatch):

@@ -3,7 +3,6 @@ import json
 import os
 import sys
 import threading
-import time
 import types
 from pathlib import Path
 
@@ -129,10 +128,14 @@ def test_worker_client_cancellation_terminates_current_worker(monkeypatch, tmp_p
     from tools.mlx_whisper_client import MLXWhisperWorker
 
     fake_module = tmp_path / "mlx_whisper.py"
+    started_path = tmp_path / "worker-started"
     fake_module.write_text(
-        "import time\n"
+        "import os\n"
+        "import threading\n"
+        "from pathlib import Path\n"
         "def transcribe(audio, **kwargs):\n"
-        "    time.sleep(10)\n"
+        "    Path(os.environ['HERMES_TEST_STARTED']).touch()\n"
+        "    threading.Event().wait()\n"
         "    return {'segments': []}\n",
         encoding="utf-8",
     )
@@ -148,6 +151,7 @@ def test_worker_client_cancellation_terminates_current_worker(monkeypatch, tmp_p
         "_child_env",
         lambda: {
             **os.environ,
+            "HERMES_TEST_STARTED": str(started_path),
             "PYTHONPATH": str(tmp_path) + os.pathsep + str(worker_script.parent),
         },
     )
@@ -160,7 +164,9 @@ def test_worker_client_cancellation_terminates_current_worker(monkeypatch, tmp_p
 
     thread = threading.Thread(target=run_request)
     thread.start()
-    time.sleep(0.15)
+    from tests.waiting import wait_until
+
+    wait_until(started_path.exists, timeout=2, what="the MLX worker to start transcription")
     cancelled.set()
     thread.join(timeout=3)
     assert not thread.is_alive()

@@ -135,7 +135,7 @@ def _default_input_samplerate(sd, device=None) -> int:
     return SAMPLE_RATE
 
 
-def list_audio_input_devices() -> List[Dict[str, Any]]:
+def list_audio_input_devices() -> list[dict[str, Any]]:
     """Return input-capable PortAudio devices for explicit voice selection."""
     try:
         sd, _ = _import_audio()
@@ -144,7 +144,7 @@ def list_audio_input_devices() -> List[Dict[str, Any]]:
         return []
     if isinstance(raw_devices, dict):
         raw_devices = [raw_devices]
-    devices: List[Dict[str, Any]] = []
+    devices: list[dict[str, Any]] = []
     try:
         for index, device in enumerate(raw_devices):
             if not isinstance(device, dict):

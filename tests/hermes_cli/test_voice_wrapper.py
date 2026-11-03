@@ -488,7 +488,7 @@ class TestSpeakTextStreamingDispatch:
         voice wrapper must use the whole-file TTS entry point so the rewrite
         layer can see the complete turn.
         """
-        import hermes_cli.voice as voice
+        from hermes_cli import voice
         import tools.tts_streaming as ts
         from tools import tts_tool
 

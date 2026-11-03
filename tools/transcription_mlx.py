@@ -6,7 +6,6 @@ import logging
 import math
 import os
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -20,6 +19,27 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 from tools.transcription_audio import _probe_audio_duration
 
 logger = logging.getLogger(__name__)
+
+
+def _transcribe_with_worker(
+    mlx_worker: Any,
+    file_path: str,
+    language: str,
+    cancel_event: Optional[threading.Event],
+) -> Optional[dict[str, Any]]:
+    from tools.mlx_whisper_client import MLXWhisperWorkerError
+
+    try:
+        result = mlx_worker.transcribe(file_path, cancel_event=cancel_event)
+    except MLXWhisperWorkerError as exc:
+        logger.warning("MLX worker transport failed; falling back to one-shot runner: %s", exc)
+        return None
+    if not isinstance(result, dict):
+        return None
+    result.setdefault("provider", "local_mlx")
+    result.setdefault("language", language)
+    result.setdefault("task", "transcribe")
+    return result
 
 
 def _transcribe_local_mlx(
@@ -58,18 +78,9 @@ def _transcribe_local_mlx(
         return _mlx_configuration_error(f"MLX runner is missing: {runner}")
 
     if mlx_worker is not None:
-        from tools.mlx_whisper_client import MLXWhisperWorkerError
-
-        try:
-            worker_result = mlx_worker.transcribe(file_path, cancel_event=cancel_event)
-        except MLXWhisperWorkerError as exc:
-            logger.warning("MLX worker transport failed; falling back to one-shot runner: %s", exc)
-        else:
-            if isinstance(worker_result, dict):
-                worker_result.setdefault("provider", "local_mlx")
-                worker_result.setdefault("language", language)
-                worker_result.setdefault("task", "transcribe")
-                return worker_result
+        worker_result = _transcribe_with_worker(mlx_worker, file_path, language, cancel_event)
+        if worker_result is not None:
+            return worker_result
 
     timeout = max(
         1.0,
@@ -195,7 +206,7 @@ DEFAULT_MLX_SILENCE_RMS_THRESHOLD = 32.0
 DEFAULT_MLX_SILENCE_PEAK_THRESHOLD = 256.0
 
 
-def _mlx_float_config(config: Dict[str, Any], key: str, default: float) -> float:
+def _mlx_float_config(config: dict[str, Any], key: str, default: float) -> float:
     """Read a finite numeric MLX option safely."""
     raw = config.get(key, default)
     try:
@@ -205,7 +216,7 @@ def _mlx_float_config(config: Dict[str, Any], key: str, default: float) -> float
     return value if math.isfinite(value) else default
 
 
-def _mlx_numeric_config_errors(config: Dict[str, Any]) -> list[str]:
+def _mlx_numeric_config_errors(config: dict[str, Any]) -> list[str]:
     """Validate MLX numeric options before they reach the child process."""
     constraints = {
         "timeout_seconds": (0.0, None),
@@ -244,13 +255,11 @@ def _mlx_numeric_config_errors(config: Dict[str, Any]) -> list[str]:
     return errors
 
 
-def _mlx_child_env(mlx_cfg: Dict[str, Any]) -> Dict[str, str]:
+def _mlx_child_env(mlx_cfg: dict[str, Any]) -> dict[str, str]:
     """Build the child environment without inheriting Hermes credentials."""
-    try:
-        from tools.environments.local import hermes_subprocess_env
-        child_env = hermes_subprocess_env(inherit_credentials=False)
-    except Exception:
-        child_env = os.environ.copy()
+    from tools.environments.local import served_profile_child_env
+
+    child_env = served_profile_child_env(inherit_credentials=False)
     for key in ("HF_HOME", "HF_ENDPOINT", "HF_API_ENDPOINT", "HF_XET_HIGH_PERFORMANCE"):
         value = mlx_cfg.get(key.lower()) or mlx_cfg.get(key)
         if value:
@@ -274,11 +283,11 @@ def _mlx_model_cached(model_name: str, hf_home: Optional[str]) -> bool:
 
 
 def check_local_mlx_requirements(
-    stt_config: Optional[Dict[str, Any]] = None,
+    stt_config: Optional[dict[str, Any]] = None,
     *,
     require_model_cache: bool = False,
     import_timeout: float = 10.0,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Check the isolated MLX runtime without loading or downloading the model."""
     if stt_config is None:
         from tools.transcription_tools import _load_stt_config
@@ -384,7 +393,7 @@ def _create_mlx_warmup_wav() -> str:
         raise
 
 
-def prewarm_local_mlx(stt_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def prewarm_local_mlx(stt_config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """Load the MLX model with a temporary tone before voice capture begins."""
     if stt_config is None:
         from tools.transcription_tools import _load_stt_config
@@ -408,6 +417,7 @@ def prewarm_local_mlx(stt_config: Optional[Dict[str, Any]] = None) -> Dict[str, 
         result.update(prewarm=True, transcript="", text="")
         return result
     except Exception as exc:
+        logger.exception("MLX prewarm failed")
         return {
             "success": False, "transcript": "", "provider": "local_mlx",
             "prewarm": True, "error_type": "runtime", "error": f"MLX prewarm failed: {exc}",
@@ -420,10 +430,10 @@ def prewarm_local_mlx(stt_config: Optional[Dict[str, Any]] = None) -> Dict[str, 
 
 
 def start_local_mlx_worker(
-    stt_config: Optional[Dict[str, Any]] = None,
+    stt_config: Optional[dict[str, Any]] = None,
     *,
     prewarm: bool = True,
-) -> tuple[Optional[Any], Dict[str, Any]]:
+) -> tuple[Optional[Any], dict[str, Any]]:
     """Start a Voice Mode scoped MLX worker and optionally load its model."""
     if stt_config is None:
         from tools.transcription_tools import _load_stt_config
@@ -464,7 +474,7 @@ def start_local_mlx_worker(
             ),
         )
         worker.start()
-        warmup_result: Dict[str, Any] = {"success": True}
+        warmup_result: dict[str, Any] = {"success": True}
         if prewarm:
             warmup_path = _create_mlx_warmup_wav()
             try:
@@ -518,40 +528,42 @@ class _MLXTranscriptionCancelled(Exception):
 def _terminate_local_mlx_process(proc: Any) -> None:
     """Terminate the MLX process group, then fall back to the child process."""
     try:
-        if proc.poll() is not None:
-            return
+        running = proc.poll() is None
     except AttributeError:
-        if getattr(proc, "returncode", None) is not None:
+        running = getattr(proc, "returncode", None) is None
+    pid = getattr(proc, "pid", None)
+    if os.name == "posix" and isinstance(pid, int):
+        from hermes_cli.process_identity import stop_owned_group_survivors
+
+        if stop_owned_group_survivors(pid, proc=proc, grace=1.0) or not running:
             return
-    if os.name != "nt":
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        except (AttributeError, OSError):
-            pass
+    if not running:
+        return
     try:
         proc.terminate()
-    except Exception:
-        pass
+    except (AttributeError, OSError):
+        return
     try:
         proc.wait(timeout=2)
-    except Exception:
+    except subprocess.TimeoutExpired:
         try:
             proc.kill()
-        except Exception:
-            pass
+        except (AttributeError, OSError):
+            return
+        proc.wait()
 
 
 def _run_local_mlx_cancelable(
     command: list[str],
     *,
     timeout: float,
-    env: Dict[str, str],
+    env: dict[str, str],
     cancel_event: threading.Event,
 ) -> subprocess.CompletedProcess:
     """Run the MLX process with bounded timeout and cooperative cancellation."""
     if cancel_event.is_set():
         raise _MLXTranscriptionCancelled
-    popen_kwargs: Dict[str, Any] = {
+    popen_kwargs: dict[str, Any] = {
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
@@ -561,9 +573,9 @@ def _run_local_mlx_cancelable(
         "env": env,
         "creationflags": windows_hide_flags(),
     }
-    if os.name != "nt":
-        popen_kwargs["start_new_session"] = True
-    proc = subprocess.Popen(command, **popen_kwargs)
+    from hermes_cli.process_identity import release_process_group_once_empty, spawn_owned
+
+    proc = spawn_owned(command, purpose="mlx-whisper-cancelable", **popen_kwargs)
     deadline = time.monotonic() + timeout
     while True:
         if cancel_event.is_set():
@@ -575,12 +587,14 @@ def _run_local_mlx_cancelable(
             raise subprocess.TimeoutExpired(command, timeout)
         try:
             stdout, stderr = proc.communicate(timeout=min(0.1, remaining))
-            return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
+            completed = subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
+            release_process_group_once_empty(proc.pid, proc=proc)
+            return completed
         except subprocess.TimeoutExpired:
             continue
 
 
-def _mlx_configuration_error(message: str) -> Dict[str, Any]:
+def _mlx_configuration_error(message: str) -> dict[str, Any]:
     return {
         "success": False,
         "transcript": "",
@@ -649,13 +663,13 @@ def _split_wav_for_local_mlx(
 def _transcribe_local_mlx_with_segments(
     file_path: str,
     model_name: str,
-    mlx_cfg: Dict[str, Any],
+    mlx_cfg: dict[str, Any],
     *,
     language: Optional[str] = None,
     prompt: Optional[str] = None,
     cancel_event: Optional[threading.Event] = None,
     mlx_worker: Optional[Any] = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Transcribe long WAVs in bounded MLX chunks and merge their text."""
     max_seconds = _mlx_float_config(mlx_cfg, "max_segment_seconds", 60.0)
     if max_seconds <= 0:
@@ -689,7 +703,7 @@ def _transcribe_local_mlx_with_segments(
         work_dir, chunks = _split_wav_for_local_mlx(file_path, max_seconds=max_seconds)
         if not chunks:
             return _mlx_configuration_error("MLX could not split the long WAV input")
-        chunk_results: list[Dict[str, Any]] = []
+        chunk_results: list[dict[str, Any]] = []
         transcripts: list[str] = []
         for index, (chunk_path, offset, chunk_duration) in enumerate(chunks):
             if cancel_event is not None and cancel_event.is_set():

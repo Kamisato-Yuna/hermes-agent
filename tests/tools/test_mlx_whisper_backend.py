@@ -348,6 +348,8 @@ def test_local_mlx_splits_long_wav_and_preserves_timeline(monkeypatch, tmp_path)
 
 
 def test_local_mlx_cancel_event_terminates_child(monkeypatch, tmp_path):
+    from hermes_cli import process_identity
+
     class FakeProcess:
         pid = 123
         returncode = None
@@ -369,14 +371,19 @@ def test_local_mlx_cancel_event_terminates_child(monkeypatch, tmp_path):
 
     process = FakeProcess()
     monkeypatch.setattr(transcription_mlx, "windows_hide_flags", lambda: 0)
-    monkeypatch.setattr(transcription_mlx.os, "getpgid", lambda pid: pid, raising=False)
-    monkeypatch.setattr(transcription_mlx.os, "killpg", lambda *args: None, raising=False)
     cancel = __import__("threading").Event()
-    def fake_popen(*args, **kwargs):
+
+    def fake_spawn(*args, **kwargs):
+        assert kwargs["purpose"] == "mlx-whisper-cancelable"
         cancel.set()
         return process
 
-    monkeypatch.setattr(transcription_mlx.subprocess, "Popen", fake_popen)
+    def stop_owned_group(_pid, *, proc, **_kwargs):
+        proc.terminate()
+        return True
+
+    monkeypatch.setattr(process_identity, "spawn_owned", fake_spawn)
+    monkeypatch.setattr(process_identity, "stop_owned_group_survivors", stop_owned_group)
     audio = tmp_path / "input.wav"
     audio.write_bytes(b"RIFF")
 

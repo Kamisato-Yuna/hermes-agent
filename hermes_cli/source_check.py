@@ -274,7 +274,7 @@ def _checked_out_branch(current_branch: Optional[str], fallback: Optional[str]) 
 
 
 def _default_branch(co: _Checkout) -> str:
-    """User-facing default for this source: fork installs follow firefly-main."""
+    """User-facing default for this source: fork installs follow main."""
     if co.repository and co.repository.casefold() == DEFAULT_UPDATE_REPOSITORY.casefold():
         return DEFAULT_UPDATE_BRANCH
     return "main"
@@ -558,7 +558,7 @@ def check_for_updates(*, install_root: Path | None = None, home: Path | None = N
     co = _read_checkout(root, _installed_git(git), embedded)
     if embedded and channel == "main":
         # Embedded builds carry no origin URL to identify this fork. For its
-        # main channel, the update hint must still follow the fork's firefly-main.
+        # main channel, the update hint must still follow the fork's main.
         co = replace(co, repository=DEFAULT_UPDATE_REPOSITORY)
     desktop_config = _read_json(branch_config_path) if branch_config_path else None
     configured_branch = _configured_branch(desktop_config)
@@ -589,8 +589,9 @@ def check_for_updates(*, install_root: Path | None = None, home: Path | None = N
     elif branch is None:
         source_target = _resolve_channel(result, channel, co, forward_only=forward_only)
         if source_target is not None and not source_target.commit:
-            if channel == "main" and _default_branch(co) == DEFAULT_UPDATE_BRANCH:
-                # The fork's main channel follows firefly-main regardless of a local main checkout.
+            if (channel == "main" and co.repository
+                    and co.repository.casefold() == DEFAULT_UPDATE_REPOSITORY.casefold()):
+                # The fork's main channel targets its default branch, not the active local branch.
                 selected_branch = configured_branch or source_target.branch or DEFAULT_UPDATE_BRANCH
             else:
                 # Upstream and named release channels preserve current/configured branch precedence.
