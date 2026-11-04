@@ -83,6 +83,8 @@ jobs:
     if: inputs.platform == 'darwin'
     runs-on: blacksmith-6vcpu-macos-15
     timeout-minutes: 30
+    # Also constrains the recording action's nested cache to read-only.
+    cache-mode: read
     env: &smoke-env
       RELEASE_COMMIT: ${{ inputs.sha }}
       RELEASE_TAG: ${{ inputs.tag }}
@@ -250,5 +252,6 @@ jobs:
     # windows-11-arm runners are much slower (npm ci alone runs 12+ minutes and
     # the MSIX leg exceeds 30 total); x64 legs complete in ~14.
     timeout-minutes: 45
+    cache-mode: read
     env: *smoke-env
     steps: *smoke-steps

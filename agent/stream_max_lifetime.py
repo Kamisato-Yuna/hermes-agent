@@ -71,3 +71,4 @@ class StreamLifetime:
             return None
         self.started = now
         return elapsed
+
