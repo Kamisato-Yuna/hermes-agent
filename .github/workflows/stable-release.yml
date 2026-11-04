@@ -76,7 +76,7 @@ jobs:
       pull-requests: write
       actions: read
       security-events: write
-    uses: ./.github/workflows/ci-orchestrator.yaml
+    uses: ./.github/workflows/ci.yaml
     with:
       commit: ${{ needs.admit.outputs.commit }}
       release: true

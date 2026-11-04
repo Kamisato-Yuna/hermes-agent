@@ -582,7 +582,7 @@ def test_ci_jobs_only_gate_on_detect_outputs_that_detect_actually_declares():
     the composite action re-exported it, but ci.yaml's ``detect`` job did not,
     so ``needs.detect.outputs.rust`` was never anything but "".
     """
-    ci = _yaml(".github/workflows/ci-orchestrator.yaml")
+    ci = _yaml(".github/workflows/ci.yaml")
     declared = set(ci["jobs"]["detect"]["outputs"])
 
     referenced: set[str] = set()
@@ -613,14 +613,14 @@ def _iter_if_expressions(job: object):
 # (caller workflow, job, called workflow, lane input) for every real-update
 # suite: each runs on a PR exactly when its lane fires and then gates the merge.
 _REAL_UPDATE_LANES = (
-    ("ci-orchestrator.yaml", "tests", "tests.yml", "e2e_upgrade"),
-    ("ci-orchestrator.yaml", "tests-os", "tests-os.yml", "e2e_upgrade"),
-    ("ci-orchestrator.yaml", "e2e-desktop-update", "e2e-desktop-update.yml", "e2e_desktop_update"),
+    ("ci.yaml", "tests", "tests.yml", "e2e_upgrade"),
+    ("ci.yaml", "tests-os", "tests-os.yml", "e2e_upgrade"),
+    ("ci.yaml", "e2e-desktop-update", "e2e-desktop-update.yml", "e2e_desktop_update"),
     ("tests-os.yml", "install-update-e2e", "windows-install-update-e2e.yml", "e2e_upgrade"),
     # Not an update suite, but the same contract: the real SSH/Docker backend lane.
-    ("ci-orchestrator.yaml", "remote-backends", "remote-backends.yml", "remote_backends"),
+    ("ci.yaml", "remote-backends", "remote-backends.yml", "remote_backends"),
     # Catalog-only PRs skip the suite, so their catalog tests must gate the merge.
-    ("ci-orchestrator.yaml", "catalog-tests", "catalog-tests.yml", "catalog"),
+    ("ci.yaml", "catalog-tests", "catalog-tests.yml", "catalog"),
 )
 
 
@@ -632,12 +632,12 @@ def test_real_update_suites_gate_the_merge_when_their_lane_fires(caller, job, ca
     reusable workflow that calls it), be gated on its lane, and never be
     ``continue-on-error``: a red shard has to block the PR it ran for.
     """
-    ci = _yaml(".github/workflows/ci-orchestrator.yaml")
+    ci = _yaml(".github/workflows/ci.yaml")
     caller_jobs = _yaml(f".github/workflows/{caller}")["jobs"]
     assert caller_jobs[job]["uses"] == f"./.github/workflows/{called}"
     gate = caller_jobs[job].get("if", "") + json.dumps(caller_jobs[job].get("with") or {})
     assert lane in gate, f"{caller}::{job} is not gated on {lane}"
-    root = job if caller == "ci-orchestrator.yaml" else "tests-os"
+    root = job if caller == "ci.yaml" else "tests-os"
     assert root in ci["jobs"]["all-checks-pass"]["needs"]
     for name, body in _yaml(f".github/workflows/{called}")["jobs"].items():
         assert not body.get("continue-on-error"), f"{called}::{name} cannot fail the merge"
