@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""Talk to Windows/SMB shares through smbclient, with no mount and no root.
+
+Usage:
+    smbfs ls     //SERVER/SHARE[/DIR] [--user PROFILE] [--long]
+    smbfs cat    //SERVER/SHARE/path/to/file
+    smbfs get    //SERVER/SHARE/path/to/file [LOCAL_PATH]
+    smbfs put    LOCAL_PATH //SERVER/SHARE/path/to/file
+    smbfs mkdir  //SERVER/SHARE/DIR
+    smbfs rmdir  //SERVER/SHARE/DIR
+    smbfs rm     //SERVER/SHARE/path/to/file
+
+Windows paths are accepted as-is: \\\\SERVER\\SHARE\\dir is rewritten to
+//SERVER/SHARE/dir.
+
+Credentials are resolved in this order:
+  1. --user PROFILE  -> that profile in $SMB_CREDENTIALS
+  2. environment     -> SMB_USER / SMB_PASSWORD / SMB_DOMAIN
+  3. default profile -> the "default" profile, or the bare keys, in
+                        $SMB_CREDENTIALS (default /opt/data/.smb-credentials)
+
+A profile file holds INI-like sections:
+
+    [default]
+    username=digital\\xuanran
+    password=********
+    domain=digital
+
+Nothing is mounted, so no CAP_SYS_ADMIN is needed: every call copies over
+SMB directly. Reads and writes are whole-file operations.
+
+Listing: `ls` hides the . and .. entries and the free-space trailer.
+Add --long to keep smbclient's raw output.
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+CRED_DEFAULT = "/opt/data/.smb-credentials"
+SMB_OPTS = ["-m", "SMB3"]
+USAGE = __doc__.split("Credential", 1)[0].strip()
+
+
+def die(msg, code=1):
+    print(f"smbfs: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def normalise(path):
+    """Accept \\\\srv\\share\\x and //srv/share/x alike; return UNC form."""
+    if not path:
+        die("empty path")
+    p = path.replace("\\", "/")
+    if not p.startswith("//"):
+        p = "//" + p.lstrip("/")
+    return p
+
+
+def split_unc(unc):
+    """//SERVER/SHARE/a/b -> ('//SERVER/SHARE', 'a/b')"""
+    parts = [x for x in unc.lstrip("/").split("/") if x]
+    if len(parts) < 2:
+        die(f"not a UNC path: {unc} (expected //SERVER/SHARE[/path])")
+    server, share = parts[0], parts[1]
+    rest = "/".join(parts[2:])
+    return f"//{server}/{share}", rest
+
+
+def parse_creds(path):
+    profiles = {}
+    current = "default"
+    if not os.path.exists(path):
+        return profiles
+    with open(path, "r", encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#") or line.startswith(";"):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                current = line[1:-1].strip() or "default"
+                profiles.setdefault(current, {})
+                continue
+            if "=" in line:
+                key, val = line.split("=", 1)
+                profiles.setdefault(current, {})[key.strip().lower()] = val.strip()
+    return profiles
+
+
+def resolve_identity(profile_name):
+    cred_path = os.environ.get("SMB_CREDENTIALS", CRED_DEFAULT)
+    profiles = parse_creds(cred_path)
+
+    if profile_name:
+        ident = profiles.get(profile_name)
+        if ident is None:
+            known = ", ".join(sorted(profiles)) or "(none)"
+            die(f"profile '{profile_name}' not found in {cred_path}; known: {known}")
+        return ident, f"{cred_path}[{profile_name}]"
+
+    env_user = os.environ.get("SMB_USER")
+    env_pass = os.environ.get("SMB_PASSWORD")
+    if env_user and env_pass:
+        return {
+            "username": env_user,
+            "password": env_pass,
+            "domain": os.environ.get("SMB_DOMAIN", ""),
+        }, "environment"
+
+    ident = profiles.get("default")
+    if ident and ident.get("username") and ident.get("password"):
+        return ident, f"{cred_path}[default]"
+
+    die(
+        "no credentials: pass --user PROFILE, set SMB_USER/SMB_PASSWORD, "
+        f"or add a [default] profile to {cred_path}"
+    )
+
+
+def take_option(args, names):
+    """Pull '--name value' out of args; return (value, remaining)."""
+    out = []
+    value = None
+    i = 0
+    while i < len(args):
+        if args[i] in names:
+            i += 1
+            if i >= len(args):
+                die(f"{names[0]} needs a value")
+            value = args[i]
+        else:
+            out.append(args[i])
+        i += 1
+    return value, out
+
+
+def drop_flags(args, flags):
+    found = [f for f in flags if f in args]
+    return found, [a for a in args if a not in flags]
+
+
+def run_smbclient(unc_share, remote_path, command, ident, want_stdout=False):
+    fd, cred_file = tempfile.mkstemp(prefix="smbfs-", suffix=".conf")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(f"username={ident['username']}\n")
+            fh.write(f"password={ident['password']}\n")
+            domain = ident.get("domain") or ""
+            if domain:
+                fh.write(f"domain={domain}\n")
+
+        argv = ["smbclient", unc_share, "-A", cred_file] + SMB_OPTS
+        if remote_path:
+            argv.append(remote_path)
+        argv += ["-c", command]
+        proc = subprocess.run(argv, capture_output=True, text=True)
+        if proc.returncode != 0:
+            msg = (proc.stderr or proc.stdout).strip()
+            die(msg or f"smbclient failed ({command})", code=proc.returncode)
+        if not want_stdout and proc.stdout:
+            sys.stdout.write(proc.stdout)
+        return proc.stdout
+    finally:
+        try:
+            os.unlink(cred_file)
+        except OSError:
+            pass
+
+
+def quote_smb(path):
+    if not path:
+        return ""
+    return '"' + path.replace('"', '\\"') + '"'
+
+
+def main():
+    if len(sys.argv) < 3:
+        print(USAGE)
+        return 2
+
+    sub = sys.argv[1]
+    args = sys.argv[2:]
+
+    profile, args = take_option(args, ("--user", "-u", "--profile"))
+    flags, args = drop_flags(args, ("--long", "-l", "--recurse"))
+    is_long = any(f in ("--long", "-l") for f in flags)
+
+    if not args:
+        die("missing path")
+
+    if sub == "put":
+        if len(args) < 2:
+            die("put needs LOCAL_PATH then //SERVER/SHARE/path")
+        local = args[0]
+        share, remote = split_unc(normalise(args[1]))
+        ident, source = resolve_identity(profile)
+        if not os.path.exists(local):
+            die(f"local file not found: {local}")
+        run_smbclient(share, None, f"put {quote_smb(local)} {quote_smb(remote)}", ident)
+        print(remote)
+        return 0
+
+    unc = normalise(args[0])
+    share, remote = split_unc(unc)
+    ident, source = resolve_identity(profile)
+
+    if sub == "ls":
+        pattern = (remote.rstrip("/") + "/*") if remote else "*"
+        out = run_smbclient(share, None, "ls " + quote_smb(pattern), ident, want_stdout=True)
+        lines = out.splitlines()
+        if not is_long:
+            lines = [l for l in lines if l.strip() and not l.lstrip().startswith(".")]
+            lines = [l for l in lines if "blocks of size" not in l]
+        body = "\n".join(lines)
+        if body:
+            sys.stdout.write(body + "\n")
+
+    elif sub == "cat":
+        if not remote:
+            die("cat needs a file path")
+        fd, tmp = tempfile.mkstemp(prefix="smbfs-cat-")
+        os.close(fd)
+        try:
+            run_smbclient(share, None, f"get {quote_smb(remote)} {quote_smb(tmp)}", ident)
+            with open(tmp, "rb") as fh:
+                sys.stdout.buffer.write(fh.read())
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    elif sub == "get":
+        if not remote:
+            die("get needs a remote file path")
+        local = args[1] if len(args) > 1 else os.path.basename(remote)
+        run_smbclient(share, None, f"get {quote_smb(remote)} {quote_smb(local)}", ident)
+        print(local)
+
+    elif sub == "mkdir":
+        if not remote:
+            die("mkdir needs a directory path")
+        run_smbclient(share, None, f"mkdir {quote_smb(remote)}", ident)
+
+    elif sub == "rmdir":
+        if not remote:
+            die("rmdir needs a directory path")
+        run_smbclient(share, None, f"rmdir {quote_smb(remote)}", ident)
+
+    elif sub == "rm":
+        if not remote:
+            die("rm needs a file path")
+        run_smbclient(share, None, f"del {quote_smb(remote)}", ident)
+
+    else:
+        die(f"unknown subcommand: {sub}\n\n{USAGE}", code=2)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

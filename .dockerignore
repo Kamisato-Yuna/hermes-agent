@@ -147,3 +147,9 @@ plans/
 /*.png.bak
 *.tar.gz
 *.tgz
+
+# 本地代码索引缓存/调试构建文件不进镜像（.codegraph 约 1.2GB）
+.codegraph/
+Dockerfile.dbg
+Dockerfile.ubuntu2604
+Dockerfile.thin
