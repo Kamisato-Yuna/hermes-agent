@@ -110,20 +110,25 @@ services:
 
 ### 4.1 旧部署的 plugins 挂载
 
-旧部署把宿主的 `~/.hermes/hermes-agent/plugins` 挂到 `/opt/hermes/plugins`。该目录是上一版 Hermes 的副本。升级镜像后，旧副本会覆盖镜像内的新插件。
+旧部署把宿主的 `~/.hermes/hermes-agent/plugins` 挂到 `/opt/hermes/plugins`。
 
-后果是插件与核心 API 不匹配。日志出现 `AttributeError: module 'tools.web_tools' has no attribute ...`。
+判断依据是镜像内容。
 
-升级后必须同步该目录。或删除该挂载，只用镜像内的插件。
+| 镜像 | `/opt/hermes/plugins` | 挂载 |
+| --- | --- | --- |
+| `hermes-gateway:v2026.8.18`（Hermes v0.20.4） | **不存在**。插件全靠挂载 | 必须保留 |
+| 本仓库构建的新镜像 | 自带 24 个插件（121 MB） | 必须删除 |
 
-```bash
-# 备份旧副本，从新镜像同步
-mv ~/.hermes/hermes-agent/plugins ~/.hermes/hermes-agent/plugins.bak-$(date +%Y%m%d)
-docker create --name tmp <profile-image>
-docker cp tmp:/opt/hermes/plugins ~/.hermes/hermes-agent/plugins
-docker rm tmp
-docker restart <container>
+同一个挂载不能同时服务两种镜像。挂载内容换成新插件的版本后，旧镜像的容器重启就会撞上插件与核心 API 不匹配。反向也一样。
+
+升级单个容器到新镜像时，必须同时删除该容器的 plugins 挂载。没升级的容器保持挂载与旧插件内容不变。
+
+```yaml
+# 新镜像的 compose：不要写这一行
+# - ~/.hermes/hermes-agent/plugins:/opt/hermes/plugins:ro
 ```
+
+症状：日志出现 `AttributeError: module 'tools.web_tools' has no attribute ...`。
 
 ## 5. 验证
 
