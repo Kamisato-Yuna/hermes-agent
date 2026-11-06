@@ -5,17 +5,21 @@ Resolves the requesting Mattermost user to an AD identity, keeps one
 credential file per user, and checks it against the target host.
 
 Usage:
-    smb-auth whoami [--user-id ID] [--username NAME] [--domain D]
+    smb-auth whoami --user-id ID [--username NAME] [--domain D]
     smb-auth path   --user-id ID
     smb-auth check  --user-id ID [--host HOST]
     smb-auth set    --user-id ID [--host HOST]   # password on stdin
     smb-auth forget --user-id ID
 
+Every command needs the caller's own Mattermost user id. A bare --username
+cannot select another user's file, and a name that does not match the id is
+refused.
+
 Exit codes for check:
     0  credentials exist and work
     3  no credentials stored -> ask the user for the AD password
     4  stored credentials rejected by the host -> ask again
-    5  cannot resolve the user name
+    5  cannot resolve the user name, or the caller does not own the name
     6  no smbclient / cannot reach host
 
 Never prints or accepts a password on the command line.
@@ -24,6 +28,7 @@ Never prints or accepts a password on the command line.
 from __future__ import annotations
 
 import argparse
+import datetime
 import getpass
 import json
 import os
@@ -92,16 +97,46 @@ def mm_username(user_id: str) -> str:
 
 
 def resolve_identity(user_id: str, username: str, domain: str) -> tuple[str, str]:
-    """Return (ad_login, bare_username)."""
-    name = username or (mm_username(user_id) if user_id else "")
+    """Return (ad_login, bare_username).
+
+    Credentials are per user. They are reachable only through the caller's own
+    Mattermost user id; a bare --username cannot select someone else's file.
+    """
+    pinned = os.environ.get("SMB_SESSION_USER_ID", "")
+    if pinned and user_id and user_id != pinned:
+        fail("refusing: --user-id does not match this session's caller", 5)
+    if not user_id:
+        fail("refusing: pass --user-id; credentials belong to a user, not a name", 5)
+    name = mm_username(user_id)
     if not name:
-        fail("need --user-id or --username", 5)
+        fail("cannot resolve user id: empty username", 5)
     name = name.split("\\")[-1]
+    if username:
+        given = username.split("\\")[-1]
+        if given.lower() != name.lower():
+            fail(
+                f"refusing: user id resolves to '{name}', not '{given}'; "
+                "each user may only use their own credential",
+                5,
+            )
     return f"{domain}\\{name}", name
 
 
 def cred_path(bare_username: str) -> str:
     return os.path.join(STORE_DIR, f"{bare_username.lower()}.ini")
+
+
+def audit(action: str, ad_login: str, host: str, detail: str = "") -> None:
+    """Append one line per credential action. Never records a password."""
+    try:
+        os.makedirs(STORE_DIR, mode=0o700, exist_ok=True)
+        path = os.path.join(STORE_DIR, "access.log")
+        stamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(f"{stamp} {action} {ad_login} host={host or '-'} {detail}\n")
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
 
 
 def read_cred(path: str) -> dict[str, str]:
@@ -180,16 +215,20 @@ def do_check(args) -> int:
     path = cred_path(bare)
     stored = read_cred(path)
     if not stored.get("username") or not stored.get("password"):
+        audit("check", ad_login, args.host, "no-credential")
         print(f"NEED_PASSWORD {ad_login}")
         return 3
     domain = stored.get("domain") or args.domain
     code = validate(stored["username"], stored["password"], domain, args.host)
     if code == 0:
+        audit("check", ad_login, args.host, "ok")
         print(f"OK {path}")
         return 0
     if code == 6:
+        audit("check", ad_login, args.host, "unavailable")
         print(f"UNAVAILABLE {ad_login}: smbclient missing or host unreachable")
         return 6
+    audit("check", ad_login, args.host, "rejected")
     print(f"INVALID_CREDENTIALS {ad_login}")
     return 4
 
@@ -204,23 +243,28 @@ def do_set(args) -> int:
         fail("empty password; nothing stored", 2)
     code = validate(ad_login, password, args.domain, args.host)
     if code == 6:
+        audit("set", ad_login, args.host, "unavailable")
         fail("smbclient missing or host unreachable; nothing stored", 6)
     if code != 0:
+        audit("set", ad_login, args.host, "rejected")
         fail(f"credentials rejected by {args.host or 'host'}; nothing stored", 4)
     path = cred_path(bare)
     write_cred(path, ad_login, args.domain, password)
+    audit("set", ad_login, args.host, "stored")
     print(f"STORED {path}")
     return 0
 
 
 def do_forget(args) -> int:
-    _, bare = resolve_identity(args.user_id, args.username, args.domain)
+    ad_login, bare = resolve_identity(args.user_id, args.username, args.domain)
     path = cred_path(bare)
     try:
         os.unlink(path)
     except FileNotFoundError:
+        audit("forget", ad_login, "", "absent")
         print(f"NOT_FOUND {path}")
         return 0
+    audit("forget", ad_login, "", "removed")
     print(f"REMOVED {path}")
     return 0
 
