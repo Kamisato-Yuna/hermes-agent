@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""Zero-privilege credential helper for SMB access in Hermes containers.
+
+Resolves the requesting Mattermost user to an AD identity, keeps one
+credential file per user, and checks it against the target host.
+
+Usage:
+    smb-auth whoami [--user-id ID] [--username NAME] [--domain D]
+    smb-auth path   --user-id ID
+    smb-auth check  --user-id ID [--host HOST]
+    smb-auth set    --user-id ID [--host HOST]   # password on stdin
+    smb-auth forget --user-id ID
+
+Exit codes for check:
+    0  credentials exist and work
+    3  no credentials stored -> ask the user for the AD password
+    4  stored credentials rejected by the host -> ask again
+    5  cannot resolve the user name
+    6  no smbclient / cannot reach host
+
+Never prints or accepts a password on the command line.
+"""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+
+STORE_DIR = os.environ.get("SMB_AUTH_DIR", "/opt/data/.smb-creds")
+ENV_FILE = os.environ.get("HERMES_ENV_FILE", "/opt/data/.env")
+DEFAULT_DOMAIN = os.environ.get("AD_DOMAIN", "digital")
+DEFAULT_HOST = os.environ.get("SMB_PROBE_HOST", "")
+
+
+def read_env_file(path: str) -> dict[str, str]:
+    """Parse KEY=VALUE lines. Quotes are stripped. Comments are skipped."""
+    values: dict[str, str] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                values.setdefault(key.strip(), val.strip().strip("'\""))
+    except OSError:
+        pass
+    return values
+
+
+def setting(key: str, fallback: str = "") -> str:
+    """Environment first, then the profile .env file."""
+    return os.environ.get(key) or read_env_file(ENV_FILE).get(key) or fallback
+
+
+def fail(message: str, code: int) -> "NoReturn":  # type: ignore[name-defined]
+    print(message)
+    raise SystemExit(code)
+
+
+def mm_username(user_id: str) -> str:
+    """Map a Mattermost user id to its username. Never returns the id."""
+    base = setting("MATTERMOST_URL").rstrip("/")
+    token = setting("MATTERMOST_TOKEN")
+    if not base or not token:
+        fail("cannot resolve user: MATTERMOST_URL or MATTERMOST_TOKEN missing", 5)
+    if not base.endswith("/api/v4"):
+        base = base + "/api/v4"
+    request = urllib.request.Request(
+        f"{base}/users/{user_id}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = json.load(response)
+    except urllib.error.HTTPError as exc:
+        fail(f"cannot resolve user id: HTTP {exc.code}", 5)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        fail(f"cannot resolve user id: {exc}", 5)
+    username = (payload or {}).get("username") or ""
+    if not username:
+        fail("cannot resolve user id: no username in response", 5)
+    return str(username)
+
+
+def resolve_identity(user_id: str, username: str, domain: str) -> tuple[str, str]:
+    """Return (ad_login, bare_username)."""
+    name = username or (mm_username(user_id) if user_id else "")
+    if not name:
+        fail("need --user-id or --username", 5)
+    name = name.split("\\")[-1]
+    return f"{domain}\\{name}", name
+
+
+def cred_path(bare_username: str) -> str:
+    return os.path.join(STORE_DIR, f"{bare_username.lower()}.ini")
+
+
+def read_cred(path: str) -> dict[str, str]:
+    """Read the [default] profile written by this helper."""
+    values: dict[str, str] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith("[") or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                values[key.strip().lower()] = val.strip()
+    except OSError:
+        return {}
+    return values
+
+
+def write_cred(path: str, ad_login: str, domain: str, password: str) -> None:
+    os.makedirs(STORE_DIR, mode=0o700, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=STORE_DIR, prefix=".tmp-", delete=False
+    )
+    try:
+        handle.write("[default]\n")
+        handle.write(f"username = {ad_login}\n")
+        handle.write(f"password = {password}\n")
+        handle.write(f"domain = {domain}\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    finally:
+        handle.close()
+    os.chmod(handle.name, 0o600)
+    os.replace(handle.name, path)
+
+
+def validate(ad_login: str, password: str, domain: str, host: str) -> int:
+    """Run smbclient against the host. Return its exit code; 6 if unusable."""
+    binary = shutil.which("smbclient")
+    if not binary:
+        return 6
+    if not host:
+        return 0
+    with tempfile.NamedTemporaryFile("w", delete=False, suffix=".ini") as handle:
+        handle.write(f"username = {ad_login}\npassword = {password}\ndomain = {domain}\n")
+        temp_path = handle.name
+    os.chmod(temp_path, 0o600)
+    try:
+        result = subprocess.run(
+            [binary, "-L", f"//{host}", "-A", temp_path, "-m", "SMB3"],
+            capture_output=True,
+            text=True,
+            timeout=40,
+        )
+    except subprocess.TimeoutExpired:
+        return 6
+    finally:
+        os.unlink(temp_path)
+    return result.returncode
+
+
+def do_whoami(args) -> int:
+    ad_login, _ = resolve_identity(args.user_id, args.username, args.domain)
+    print(ad_login)
+    return 0
+
+
+def do_path(args) -> int:
+    _, bare = resolve_identity(args.user_id, args.username, args.domain)
+    print(cred_path(bare))
+    return 0
+
+
+def do_check(args) -> int:
+    ad_login, bare = resolve_identity(args.user_id, args.username, args.domain)
+    path = cred_path(bare)
+    stored = read_cred(path)
+    if not stored.get("username") or not stored.get("password"):
+        print(f"NEED_PASSWORD {ad_login}")
+        return 3
+    domain = stored.get("domain") or args.domain
+    code = validate(stored["username"], stored["password"], domain, args.host)
+    if code == 0:
+        print(f"OK {path}")
+        return 0
+    if code == 6:
+        print(f"UNAVAILABLE {ad_login}: smbclient missing or host unreachable")
+        return 6
+    print(f"INVALID_CREDENTIALS {ad_login}")
+    return 4
+
+
+def do_set(args) -> int:
+    ad_login, bare = resolve_identity(args.user_id, args.username, args.domain)
+    if sys.stdin.isatty():
+        password = getpass.getpass(f"AD password for {ad_login}: ")
+    else:
+        password = sys.stdin.readline().rstrip("\n")
+    if not password:
+        fail("empty password; nothing stored", 2)
+    code = validate(ad_login, password, args.domain, args.host)
+    if code == 6:
+        fail("smbclient missing or host unreachable; nothing stored", 6)
+    if code != 0:
+        fail(f"credentials rejected by {args.host or 'host'}; nothing stored", 4)
+    path = cred_path(bare)
+    write_cred(path, ad_login, args.domain, password)
+    print(f"STORED {path}")
+    return 0
+
+
+def do_forget(args) -> int:
+    _, bare = resolve_identity(args.user_id, args.username, args.domain)
+    path = cred_path(bare)
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        print(f"NOT_FOUND {path}")
+        return 0
+    print(f"REMOVED {path}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="smb-auth", description=__doc__)
+    parser.add_argument("command", choices=["whoami", "path", "check", "set", "forget"])
+    parser.add_argument("--user-id", default="", help="Mattermost user id")
+    parser.add_argument("--username", default="", help="Mattermost or AD user name")
+    parser.add_argument("--domain", default=DEFAULT_DOMAIN, help="AD domain")
+    parser.add_argument("--host", default=DEFAULT_HOST, help="host to validate against")
+    args = parser.parse_args()
+
+    handlers = {
+        "whoami": do_whoami,
+        "path": do_path,
+        "check": do_check,
+        "set": do_set,
+        "forget": do_forget,
+    }
+    return handlers[args.command](args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

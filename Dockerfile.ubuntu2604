@@ -108,6 +108,7 @@ RUN if [ "$HERMES_BOT_DESKTOP" = "1" ]; then \
 # mount and no root. Ships with the image so a distributed profile needs no
 # extra compose privileges. See docker/smb/smbfs for usage.
 COPY --chmod=0755 docker/smb/smbfs /usr/local/bin/smbfs
+COPY --chmod=0755 docker/smb/smb-auth /usr/local/bin/smb-auth
 
 # Prefer the fixed SQLite over Debian's vulnerable libsqlite3.so.0. Keep the
 # public library name stable so both the system interpreter and the uv-created
