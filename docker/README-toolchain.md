@@ -20,9 +20,32 @@ profile 镜像从 toolchain 镜像继承。两个镜像的同名层完全一致�
 只用干净的克隆构建。不要用开发工作树。开发工作树含 `.codegraph/` 索引缓存和调试文件。`.codegraph/` 约 1.2 GB。
 
 ```bash
-git clone --depth 1 https://github.com/Kamisato-Yuna/hermes-agent.git hermes-clean
+git clone https://github.com/Kamisato-Yuna/hermes-agent.git hermes-clean
 cd hermes-clean
+git fetch --tags origin
 ```
+
+不要用 `--depth 1` 克隆。浅克隆的历史被嫁接，`git describe` 算出的距离错误。版本号也会变成 `vunknown`。
+
+### 2.1 生成构建身份
+
+镜像的版本号来自源码树里的 `install-stamp.json`。该文件被 `.gitignore` 排除，干净克隆里没有。
+
+构建前用仓库自己的代码生成它。
+
+```bash
+python3 -c "
+import sys; sys.path.insert(0, '.')
+from pathlib import Path
+from hermes_cli.source_stamp import write_source_stamp
+d = write_source_stamp(Path('.'))
+print(d['displayVersion'], d['commit'][:8])
+"
+```
+
+输出应类似 `0.22.7+207.g169354c 169354c4`。如果输出 `unknown`，说明 tag 或历史不全。
+
+### 2.2 构建 toolchain 镜像
 
 先建 toolchain 镜像。用 `--target runtime_base` 只构建工具链阶段。
 
@@ -83,6 +106,23 @@ compose 只引用 profile 镜像。不需要额外挂载。工具链已在镜像
 services:
   hermes-manager:
     image: hermes-gateway:firefly-0.22.7-<commit>
+```
+
+### 4.1 旧部署的 plugins 挂载
+
+旧部署把宿主的 `~/.hermes/hermes-agent/plugins` 挂到 `/opt/hermes/plugins`。该目录是上一版 Hermes 的副本。升级镜像后，旧副本会覆盖镜像内的新插件。
+
+后果是插件与核心 API 不匹配。日志出现 `AttributeError: module 'tools.web_tools' has no attribute ...`。
+
+升级后必须同步该目录。或删除该挂载，只用镜像内的插件。
+
+```bash
+# 备份旧副本，从新镜像同步
+mv ~/.hermes/hermes-agent/plugins ~/.hermes/hermes-agent/plugins.bak-$(date +%Y%m%d)
+docker create --name tmp <profile-image>
+docker cp tmp:/opt/hermes/plugins ~/.hermes/hermes-agent/plugins
+docker rm tmp
+docker restart <container>
 ```
 
 ## 5. 验证
