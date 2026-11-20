@@ -10,6 +10,9 @@ from gateway.config import GatewayConfig, Platform
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, SessionStore, build_session_key
+from tests.fixtures.storage_read import session_row
+
+pytestmark = pytest.mark.usefixtures("authority_cwd_in_tmp")  # symbolic profile ids are relative homes
 
 
 def _event(text: str, source: SessionSource) -> MessageEvent:
@@ -41,14 +44,14 @@ async def test_reset_clears_a_persisted_override_after_restart(tmp_path, monkeyp
     runner._evict_cached_agent = lambda k, **_kw: evicted.append(k)
     runner._normalize_source_for_session_key = lambda s: s
     runner._session_key_for_source = lambda s: build_session_key(s)
-    runner._pending_one_turn_model_restores[key] = {"had_override": False, "override": None}
+    runner._session_state(key).conversation.one_turn_restore = {"had_override": False, "override": None}
 
     reply = await runner._handle_model_command(_event("/model reset", source))
 
     assert "cfg-model" in reply
     assert store.get_model_override(key) is None
     assert runner._session_model_overrides.get(key) is None
-    assert runner._pending_one_turn_model_restores.get(key) is None  # an armed --once can't re-plant it
+    assert runner._session_state(key).conversation.one_turn_restore is None  # an armed --once can't re-plant it
     assert evicted == [key]
     assert "pinned-model" in runner._pending_model_notes[key]
 
@@ -83,7 +86,7 @@ async def test_owner_reset_returns_a_local_session_to_the_configured_default_rea
         live = authority.sessions[sid]
 
         async def pick(model):
-            snap = authority.db.get_session(sid)
+            snap = session_row(authority.persistence, sid)
             response = await owner.dispatch({"id": model, "method": "session.mutate", "params": dict(
                 session_id=sid, request_id=f"{model}-{snap['runtime_revision']}", operation="model",
                 payload={"model": model}, expected_revision=snap["runtime_revision"],
@@ -95,10 +98,10 @@ async def test_owner_reset_returns_a_local_session_to_the_configured_default_rea
         _profile(home, "cfg-b", 1, "k")  # edited after launch: reset reads config.yaml now
         await pick("reset")
         assert policy_for_source(runner, live.source).model == "cfg-b"
-        revision = authority.db.get_session(sid)["runtime_revision"]
+        revision = session_row(authority.persistence, sid)["runtime_revision"]
         again = await pick("reset")
         assert again.get("status") == "noop" and "cfg-b" in again.get("note", "")
-        assert authority.db.get_session(sid)["runtime_revision"] == revision
+        assert session_row(authority.persistence, sid)["runtime_revision"] == revision
     finally:
         await owner.close()
         store.close_all_db_handles()
@@ -126,7 +129,7 @@ async def test_owner_reset_restores_the_profile_route_when_model_and_provider_ma
     monkeypatch.setattr(gateway_run, "_hermes_home", home)
     store, runner, authority, owner = _owner(home)
     from gateway.session_policy import profile_config
-    assert authority.db.db_path.resolve().parent == home.resolve()
+    assert authority.persistence.scope.profile_dir.resolve() == home.resolve()
     assert profile_config(authority).get("model", {}).get("default") == "same-model"
     runner._peek_session_state = lambda _key: None
     runner._resolve_session_agent_runtime = (
@@ -145,10 +148,10 @@ async def test_owner_reset_restores_the_profile_route_when_model_and_provider_ma
         assert runtime["base_url"].rstrip("/") == override_url
         assert runtime["api_key"] == override_key
         from gateway.session_policy import profile_config
-        assert authority.db.db_path.resolve().parent == home.resolve()
+        assert authority.persistence.scope.profile_dir.resolve() == home.resolve()
         assert profile_config(authority).get("model", {}).get("default") == "same-model"
 
-        snapshot = authority.db.get_session(sid)
+        snapshot = session_row(authority.persistence, sid)
         response = await owner.dispatch({"id": "reset", "method": "session.mutate", "params": dict(
             session_id=sid, request_id="reset", operation="model", payload={"model": "reset"},
             expected_revision=snapshot["runtime_revision"], expected_generation=snapshot["runtime_generation"])})
